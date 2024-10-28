@@ -1,18 +1,18 @@
 MODEL_CONFIG = {
-    "claude-3-5-sonnet-20241022": {
-        "friendly_name": "Claude 3.5 Sonnet",
+    "anthropic.claude-3-sonnet-20240229-v1:0": {
+        "friendly_name": "Claude 3 Sonnet (Bedrock)",
         "max_tokens": 8192,
         "temperature": 0.5,
-        "provider": "anthropic",
-        "supports_system_message": False,
+        "provider": "bedrock",
+        "supports_system_message": True,
         "supports_streaming": True,
     },
-    "claude-3-opus-20240229": {
-        "friendly_name": "Claude 3 Opus",
+    "anthropic.claude-3-haiku-20240307-v1:0": {
+        "friendly_name": "Claude 3 Haiku (Bedrock)",
         "max_tokens": 4096,
         "temperature": 0.5,
-        "provider": "anthropic",
-        "supports_system_message": False,
+        "provider": "bedrock",
+        "supports_system_message": True,
         "supports_streaming": True,
     },
 }

@@ -9,9 +9,9 @@ import sys
 import tiktoken
 import time
 import subprocess
+import boto3
 
 from datetime import datetime
-from anthropic import Anthropic
 from prompt_toolkit import prompt
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import HTML
@@ -26,10 +26,96 @@ from model_config import get_model_list, get_model_config
 console = Console(highlight=False)
 current_chat_file = None
 
+class BedrockClient:
+    def __init__(self, region_name='eu-west-2'):
+        self.client = boto3.client('bedrock-runtime', region_name=region_name)
+        
+    def create_message(self, model_id, messages, system=None, max_tokens=None, temperature=None, stream=False):
+        # Filter out empty messages and format them correctly for Bedrock
+        formatted_messages = []
+        for msg in messages:
+            if msg.get("content"):  # Only include messages with content
+                formatted_messages.append({
+                    "role": msg["role"],
+                    "content": [{
+                        "type": "text",
+                        "text": msg["content"]
+                    }]
+                })
+
+        # Construct request body according to Bedrock's requirements
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": formatted_messages,
+            "max_tokens": max_tokens or 4096,
+            "temperature": temperature or 0.7
+        }
+        
+        if system:
+            request_body["system"] = system
+
+        # Convert to JSON string
+        body = json.dumps(request_body)
+        
+        if stream:
+            response = self.client.invoke_model_with_response_stream(
+                modelId=model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=body
+            )
+            return BedrockStreamWrapper(response)
+        else:
+            response = self.client.invoke_model(
+                modelId=model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=body
+            )
+            response_body = json.loads(response.get('body').read())
+            return BedrockResponseWrapper(response_body)
+
+class BedrockStreamWrapper:
+    def __init__(self, stream_response):
+        self.stream = stream_response.get('body')
+        
+    def __iter__(self):
+        for event in self.stream:
+            chunk = json.loads(event['chunk']['bytes'].decode())
+            yield BedrockChunkWrapper(chunk)
+
+class BedrockChunkWrapper:
+    def __init__(self, chunk):
+        # Handle the Bedrock streaming response format
+        if 'type' in chunk:
+            self.type = chunk['type']
+        else:
+            self.type = 'content_block_delta'
+        
+        if 'delta' in chunk:
+            self.delta = BedrockDeltaWrapper(chunk['delta'])
+        else:
+            # Handle the case where we get the full content
+            content = chunk.get('content', [{'text': ''}])[0]
+            self.delta = BedrockDeltaWrapper({'text': content.get('text', '')})
+
+class BedrockDeltaWrapper:
+    def __init__(self, delta):
+        self.text = delta.get('text', '')
+
+class BedrockResponseWrapper:
+    def __init__(self, response):
+        # Extract the text content from the Bedrock response format
+        content = response.get('content', [{'text': ''}])[0]
+        self.content = [BedrockContentWrapper({'text': content.get('text', '')})]
+
+class BedrockContentWrapper:
+    def __init__(self, response):
+        self.text = response.get('text', '')
 def ensure_chat_history_dir():
     """Ensures that the chat history base directory exists."""
     home_dir = os.path.expanduser("~")
-    chat_history_base_dir = os.path.join(home_dir, '.chatbot', 'chat-history', 'anthropic')
+    chat_history_base_dir = os.path.join(home_dir, '.wilma', 'chat-history', 'anthropic')
     os.makedirs(chat_history_base_dir, exist_ok=True)
     return chat_history_base_dir
 
@@ -323,8 +409,8 @@ def should_perform_web_search(content, selected_model, model_config, client):
 
 def main():
     args = parse_arguments()
-
-    default_model = "claude-3-5-sonnet-20241022"
+    
+    default_model = "anthropic.claude-3-sonnet-20240229-v1:0"
 
     if args.model_select:
         if args.model_select == 'show_menu':
@@ -339,7 +425,7 @@ def main():
 
     model_config = get_model_config(selected_model)
     friendly_name = model_config["friendly_name"]
-    client = Anthropic()
+    client = BedrockClient()  # Initialize our Bedrock client wrapper
     web_search_enabled = args.web_search
 
     try:
@@ -348,8 +434,8 @@ def main():
         todays_chat_dir = get_todays_chat_dir(chat_history_base_dir)
 
         now = datetime.now()
-        local_date = now.strftime("%a %d %b %Y")  # e.g., "Fri 16 Feb 2024"
-        local_time = now.strftime("%H:%M:%S %Z")  # e.g., "22:41:47 GMT+0000"
+        local_date = now.strftime("%a %d %b %Y")
+        local_time = now.strftime("%H:%M:%S %Z")
 
         system_prompt = (f"Specifically, your model is \"{friendly_name}\". Your knowledge base was last updated "
                         f"in July 2024. Today is {local_date}. Local time is {local_time}. You write in British "
@@ -369,7 +455,7 @@ def main():
             messages = []
 
         welcome = f"""
-You're now chatting with {friendly_name}.
+You're now chatting with {friendly_name} via Amazon Bedrock.
 The user prompt handles multiline input, so Enter gives a newline.
 To submit your prompt hit Esc -> Enter.
 To exit gracefully simply submit the word: "exit", or hit Ctrl+C.
@@ -451,8 +537,8 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
             supports_streaming = model_config.get("supports_streaming", True)
 
             if supports_streaming:
-                stream = client.messages.create(
-                    model=selected_model,
+                stream = client.create_message(
+                    model_id=selected_model,
                     messages=messages,
                     system=system_prompt,
                     max_tokens=model_config["max_tokens"],
@@ -473,12 +559,12 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                         elif chunk.type == "message_stop":
                             break
             else:
-                response = client.messages.create(
-                    model=selected_model,
+                response = client.create_message(
+                    model_id=selected_model,
                     messages=messages,
                     system=system_prompt,
                     max_tokens=model_config["max_tokens"],
-                    temperature=model_config["temperature"],
+                    temperature=model_config["temperature"]
                 )
                 complete_message = response.content[0].text
                 console.print(Markdown(complete_message))
@@ -498,4 +584,4 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
             os._exit(0)
 
 if __name__ == "__main__":
-    main()        
+    main()
