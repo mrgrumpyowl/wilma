@@ -27,9 +27,9 @@ console = Console(highlight=False)
 current_chat_file = None
 
 class BedrockClient:
-    def __init__(self, region_name='eu-west-2'):
+    def __init__(self, region_name='us-west-2'):
         self.client = boto3.client('bedrock-runtime', region_name=region_name)
-        
+
     def create_message(self, model_id, messages, system=None, max_tokens=None, temperature=None, stream=False):
         # Filter out empty messages and format them correctly for Bedrock
         formatted_messages = []
@@ -50,13 +50,13 @@ class BedrockClient:
             "max_tokens": max_tokens or 4096,
             "temperature": temperature or 0.7
         }
-        
+
         if system:
             request_body["system"] = system
 
         # Convert to JSON string
         body = json.dumps(request_body)
-        
+
         if stream:
             response = self.client.invoke_model_with_response_stream(
                 modelId=model_id,
@@ -78,7 +78,7 @@ class BedrockClient:
 class BedrockStreamWrapper:
     def __init__(self, stream_response):
         self.stream = stream_response.get('body')
-        
+
     def __iter__(self):
         for event in self.stream:
             chunk = json.loads(event['chunk']['bytes'].decode())
@@ -91,7 +91,7 @@ class BedrockChunkWrapper:
             self.type = chunk['type']
         else:
             self.type = 'content_block_delta'
-        
+
         if 'delta' in chunk:
             self.delta = BedrockDeltaWrapper(chunk['delta'])
         else:
@@ -112,6 +112,7 @@ class BedrockResponseWrapper:
 class BedrockContentWrapper:
     def __init__(self, response):
         self.text = response.get('text', '')
+
 def ensure_chat_history_dir():
     """Ensures that the chat history base directory exists."""
     home_dir = os.path.expanduser("~")
@@ -309,7 +310,7 @@ def select_model():
     for idx, model in enumerate(models, 1):
         friendly_name = get_model_config(model)["friendly_name"]
         console.print(f"[bold blue]{idx}) {friendly_name}[/]")
-    
+
     while True:
         try:
             choice = int(input("\nSelect a model (enter the number): "))
@@ -373,9 +374,9 @@ def perform_web_search(query):
         ],
         "temperature": 0.3
     }
-    
+
     response = requests.request("POST", url, json=payload, headers=headers)
-    
+
     if response.status_code == 200:
         content = response.json()['choices'][0]['message']['content'].strip()
         return f"Found online today, {local_date}, at time {local_time}: {content}"
@@ -409,8 +410,8 @@ def should_perform_web_search(content, selected_model, model_config, client):
 
 def main():
     args = parse_arguments()
-    
-    default_model = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+    default_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 
     if args.model_select:
         if args.model_select == 'show_menu':
@@ -465,7 +466,7 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
 """
 
         console.print(f"[bold blue]{welcome}[/]")
-        
+
         while True:
             content = get_user_input()
 
@@ -523,7 +524,7 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                             response_content += f"<web-search-results> {web_search_results} </web-search-results>"
                         except Exception as e:
                             print(f"Error during web search: {e}")
-                
+
                     if response_content:
                         append_message(messages, "assistant", response_content)
                         websearch_analysis_request = ("Thank you for carrying out a web search on my behalf with Perplexity. "
