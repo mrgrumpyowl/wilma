@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 
 import argparse
+import boto3
+import botocore
 import fnmatch
 import json
 import os
 import requests
 import sys
+import subprocess
 import tiktoken
 import time
-import subprocess
-import boto3
 
 from datetime import datetime
+from halo import Halo
 from prompt_toolkit import prompt
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import HTML
@@ -20,65 +22,166 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
+from typing import Optional, Tuple
 
-from model_config import get_model_list, get_model_config
+from model_config import check_model_access, get_available_models, get_model_list, get_model_config
 
 console = Console(highlight=False)
 current_chat_file = None
 
-class BedrockClient:
-    def __init__(self, region_name='eu-west-2'):
-        self.client = boto3.client('bedrock-runtime', region_name=region_name)
-        
-    def create_message(self, model_id, messages, system=None, max_tokens=None, temperature=None, stream=False):
-        # Filter out empty messages and format them correctly for Bedrock
-        formatted_messages = []
-        for msg in messages:
-            if msg.get("content"):  # Only include messages with content
-                formatted_messages.append({
-                    "role": msg["role"],
-                    "content": [{
-                        "type": "text",
-                        "text": msg["content"]
-                    }]
-                })
+def check_aws_authentication() -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Check if the user has an active AWS session and get their region.
+    Returns a tuple of (is_authenticated, region, error_message)
+    """
+    try:
+        # Try to get the default session credentials
+        session = boto3.Session()
+        credentials = session.get_credentials()
 
-        # Construct request body according to Bedrock's requirements
-        request_body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "messages": formatted_messages,
-            "max_tokens": max_tokens or 4096,
-            "temperature": temperature or 0.7
-        }
-        
-        if system:
-            request_body["system"] = system
+        if not credentials:
+            # Check if credentials file exists but no active session
+            if os.path.exists(os.path.expanduser('~/.aws/credentials')):
+                return False, None, ("No active AWS session found.\n"
+                                   "Please start a new AWS session using Leapp or saml2aws (etc).\n"
+                                   "e.g. If using Leapp, run 'leapp session start' to start a new session.")
+            else:
+                return False, None, "No AWS credentials found. Please run 'aws configure' to set up your credentials."
 
-        # Convert to JSON string
-        body = json.dumps(request_body)
-        
-        if stream:
-            response = self.client.invoke_model_with_response_stream(
-                modelId=model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=body
-            )
-            return BedrockStreamWrapper(response)
+        # Get the current region
+        region = session.region_name
+        if not region:
+            return False, None, "No AWS region configured. Please run 'aws configure' to set up your region."
+
+        # Verify session is active by making a simple API call
+        try:
+            sts = session.client('sts')
+            identity = sts.get_caller_identity()
+            return True, region, None
+
+        except botocore.exceptions.ClientError as e:
+            if 'expired' in str(e).lower():
+                return False, None, ("AWS session has expired.\n"
+                                   "Please refresh your session using Leapp or saml2aws (etc).\n"
+                                   "e.g. If using Leapp, run 'leapp session start' to start a new session.")
+            elif 'not authorized' in str(e).lower():
+                return False, None, ("Your AWS credentials don't have the required permissions.\n"
+                                   "Please ensure you have the necessary IAM permissions for Bedrock.")
+            else:
+                return False, None, f"AWS authentication error: {str(e)}"
+
+    except botocore.exceptions.ProfileNotFound:
+        return False, None, ("AWS profile not found.\n"
+                           "If using Leapp, ensure you have an active session. "
+                           "Run 'leapp session start' to start a new session.")
+    except botocore.exceptions.NoCredentialsError:
+        if os.path.exists(os.path.expanduser('~/.aws/credentials')):
+            return False, None, ("Found AWS credentials but no active session.\n"
+                               "Please start a new AWS session using Leapp or saml2aws (etc).\n"
+                               "e.g. If using Leapp, run 'leapp session start' to start a new session.")
         else:
-            response = self.client.invoke_model(
-                modelId=model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=body
-            )
-            response_body = json.loads(response.get('body').read())
-            return BedrockResponseWrapper(response_body)
+            return False, None, "No AWS credentials found. Please run 'aws configure' to set up your credentials."
+
+class BedrockClient:
+    def __init__(self, region_name=None):
+        """
+        Initialise the Bedrock client with dynamic region handling
+        """
+        try:
+            if not region_name:
+                session = boto3.Session()
+                region_name = session.region_name
+                if not region_name:
+                    raise RuntimeError("No AWS region configured. Please configure your AWS region.")
+
+            self.client = boto3.client('bedrock-runtime', region_name=region_name)
+            self.region = region_name  # Store the region for reference
+
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'AccessDeniedException':
+                raise RuntimeError("Access denied to Bedrock. Please check your IAM permissions.")
+            elif e.response['Error']['Code'] == 'UnrecognizedClientException':
+                raise RuntimeError("Invalid AWS credentials. Please check your AWS configuration.")
+            else:
+                raise RuntimeError(f"Error initializing Bedrock client: {str(e)}")
+        except botocore.exceptions.EndpointConnectionError:
+            raise RuntimeError(f"Could not connect to Bedrock in region {region_name}. Please check if Bedrock is available in this region.")
+
+    def create_message(self, model_id, messages, system=None, max_tokens=None, temperature=None, stream=False):
+        try:
+            # Filter out empty messages and format them correctly for Bedrock
+            formatted_messages = []
+            for msg in messages:
+                if msg.get("content"):  # Only include messages with content
+                    formatted_messages.append({
+                        "role": msg["role"],
+                        "content": [{
+                            "type": "text",
+                            "text": msg["content"]
+                        }]
+                    })
+
+            # Construct request body according to Bedrock's requirements
+            request_body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "messages": formatted_messages,
+                "max_tokens": max_tokens or 4096,
+                "temperature": temperature or 0.7
+            }
+
+            if system:
+                request_body["system"] = system
+
+            # Convert to JSON string
+            body = json.dumps(request_body)
+
+            if stream:
+                try:
+                    response = self.client.invoke_model_with_response_stream(
+                        modelId=model_id,
+                        contentType="application/json",
+                        accept="application/json",
+                        body=body
+                    )
+                    return BedrockStreamWrapper(response)
+                except botocore.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] == 'ModelNotFound':
+                        available_models = self._get_available_models()
+                        raise RuntimeError(f"Model {model_id} not found. Available models: {', '.join(available_models)}")
+                    raise RuntimeError(f"Error streaming from model: {str(e)}")
+            else:
+                try:
+                    response = self.client.invoke_model(
+                        modelId=model_id,
+                        contentType="application/json",
+                        accept="application/json",
+                        body=body
+                    )
+                    response_body = json.loads(response.get('body').read())
+                    return BedrockResponseWrapper(response_body)
+                except botocore.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] == 'ModelNotFound':
+                        available_models = self._get_available_models()
+                        raise RuntimeError(f"Model {model_id} not found. Available models: {', '.join(available_models)}")
+                    raise RuntimeError(f"Error invoking model: {str(e)}")
+
+        except json.JSONDecodeError:
+            raise RuntimeError("Error parsing model response")
+        except Exception as e:
+            raise RuntimeError(f"Unexpected error creating message: {str(e)}")
+
+    def _get_available_models(self) -> list:
+        try:
+            bedrock = boto3.client('bedrock')
+            response = bedrock.list_foundation_models()
+            return [model['modelId'] for model in response['modelSummaries']]
+        except Exception:
+            return []  # Return empty list if we can't get models
 
 class BedrockStreamWrapper:
     def __init__(self, stream_response):
         self.stream = stream_response.get('body')
-        
+
     def __iter__(self):
         for event in self.stream:
             chunk = json.loads(event['chunk']['bytes'].decode())
@@ -91,7 +194,7 @@ class BedrockChunkWrapper:
             self.type = chunk['type']
         else:
             self.type = 'content_block_delta'
-        
+
         if 'delta' in chunk:
             self.delta = BedrockDeltaWrapper(chunk['delta'])
         else:
@@ -112,6 +215,7 @@ class BedrockResponseWrapper:
 class BedrockContentWrapper:
     def __init__(self, response):
         self.text = response.get('text', '')
+
 def ensure_chat_history_dir():
     """Ensures that the chat history base directory exists."""
     home_dir = os.path.expanduser("~")
@@ -136,8 +240,8 @@ def save_chat(chat_data, chat_dir):
 
     with open(current_chat_file, 'w', encoding='utf-8') as f:
         json.dump(chat_data, f, ensure_ascii=False, indent=4)
-def load_chat(file_path):
 
+def load_chat(file_path):
     """Loads chat data from a file."""
     with open(file_path, 'r', encoding='utf-8') as f:
         return json.load(f)
@@ -303,22 +407,126 @@ def should_exit(content: str) -> bool:
 def append_message(messages: list, role: str, content: str):
     messages.append({"role": role, "content": content})
 
-def select_model():
-    models = get_model_list()
-    console.print("[bold blue]\nAvailable models:[/]")
-    for idx, model in enumerate(models, 1):
-        friendly_name = get_model_config(model)["friendly_name"]
-        console.print(f"[bold blue]{idx}) {friendly_name}[/]")
-    
-    while True:
-        try:
-            choice = int(input("\nSelect a model (enter the number): "))
-            if 1 <= choice <= len(models):
-                return models[choice - 1]
-            else:
-                print("Invalid choice. Please try again.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
+def select_model(debug=False):
+    """
+    Present user with a list of available Anthropic models and handle selection.
+    Only shows models that are both available in the current region and configured.
+    """
+    try:
+        with Halo(text='Checking Anthropic models available to you in this region...', spinner='dots') as spinner:
+            models = get_available_models(debug=debug)
+            if not models:
+                spinner.stop()
+                console.print("[bold red]No Anthropic models are currently available in your region or you lack permissions to access them.[/]")
+                sys.exit(1)
+            spinner.stop()
+
+        console.print("[bold blue]\nAvailable models:[/]")
+        for idx, model in enumerate(models, 1):
+            friendly_name = get_model_config(model)["friendly_name"]
+            console.print(f"[bold blue]{idx}) {friendly_name}[/]")
+
+        while True:
+            try:
+                choice = int(input("\nSelect a model (enter the number): "))
+                if 1 <= choice <= len(models):
+                    return models[choice - 1]
+                else:
+                    print("Invalid choice. Please try again.")
+            except ValueError:
+                print("Invalid input. Please enter a number.")
+            except KeyboardInterrupt:
+                print("\nInterrupted by user")
+                try:
+                    sys.exit(0)
+                except SystemExit:
+                    os._exit(0)
+    except Exception as e:
+        console.print(f"[bold red]Error selecting model: {e}[/]")
+        sys.exit(1)
+
+def check_default_model(default_model, region, debug=False):
+    """
+    Check if the default model is available and accessible.
+    If not, fall back to model selection.
+    """
+    with Halo(text='Checking default model...', spinner='dots') as spinner:
+        runtime_client = boto3.client('bedrock-runtime', region_name=region)
+        if not get_model_config(default_model):
+            spinner.stop()
+            console.print("[yellow]Default model not configured. Falling back to model selection...[/]")
+            return select_model(debug=debug)
+
+        if check_model_access(runtime_client, default_model, debug):
+            return default_model
+
+        spinner.stop()
+        console.print("[yellow]Default model not available. Falling back to model selection...[/]")
+        return select_model(debug=debug)
+
+def get_user_default_model():
+    """
+    Check for a user-defined default model in ~/.wilma/config.
+    Returns the model name if found and valid, None otherwise.
+    """
+    config_path = os.path.expanduser("~/.wilma/config")
+
+    # If config doesn't exist, silently return None
+    if not os.path.exists(config_path):
+        return None
+
+    try:
+        # Check if file is readable
+        if not os.access(config_path, os.R_OK):
+            console.print("[yellow]Warning: ~/.wilma/config exists but is not readable[/]")
+            return None
+
+        # Check file size
+        if os.path.getsize(config_path) > 1024:  # Arbitrary 1KB limit
+            console.print("[yellow]Warning: ~/.wilma/config is suspiciously large[/]")
+            return None
+
+        with open(config_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+
+                if line.startswith('default_model'):
+                    # Extract the model name between quotes
+                    parts = line.split('=', 1)  # Split on first = only
+                    if len(parts) != 2:
+                        continue
+
+                    model = parts[1].strip().strip('"\'')
+
+                    # Validate model name format
+                    if not model.startswith('anthropic.'):
+                        console.print("[yellow]Warning: Invalid model name format in ~/.wilma/config[/]")
+                        return None
+
+                    # Check for suspicious characters
+                    if any(char in model for char in ';&|$<>{}[]\\'):
+                        console.print("[yellow]Warning: Suspicious characters in model name in ~/.wilma/config[/]")
+                        return None
+
+                    # Optional: Check if this model exists in our known models
+                    if not get_model_config(model):
+                        console.print("[yellow]Warning: Unknown model specified in ~/.wilma/config[/]")
+                        return None
+
+                    return model
+
+        return None
+
+    except UnicodeDecodeError:
+        console.print("[yellow]Warning: ~/.wilma/config is not a valid text file[/]")
+        return None
+    except Exception as e:
+        if str(e):  # Only print if there's an actual error message
+            console.print(f"[yellow]Warning: Error reading ~/.wilma/config: {str(e)}[/]")
+        return None
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -331,17 +539,20 @@ def parse_arguments():
         nargs='?',
         const='show_menu',
         metavar="MODEL",
-        help="Select the AI model to use. Options:\n"
+        help="Select the Anthropic (via Amazon Bedrock) model to use. Options:\n"
              "  - Specify a model name directly\n"
-             "  - Use without a value to show the model selection menu\n"
+             "  - Use without a value to select from a list of models available in your authenticated AWS region\n"
              "  - Omit to use the default model (claude-3-5-sonnet-20241022)\n"
-             "Available models:\n" +
-             "\n".join(f"  - {model}" for model in get_model_list())
     )
     parser.add_argument(
         "-ws", "--web-search",
         action='store_true',
         help="Enable web search functionality for answering queries."
+    )
+    parser.add_argument(
+        "--debug",
+        action='store_true',
+        help="Enable debug output"
     )
     return parser.parse_args()
 
@@ -373,9 +584,9 @@ def perform_web_search(query):
         ],
         "temperature": 0.3
     }
-    
+
     response = requests.request("POST", url, json=payload, headers=headers)
-    
+
     if response.status_code == 200:
         content = response.json()['choices'][0]['message']['content'].strip()
         return f"Found online today, {local_date}, at time {local_time}: {content}"
@@ -407,29 +618,58 @@ def should_perform_web_search(content, selected_model, model_config, client):
     else:
         return False, ""
 
-def main():
-    args = parse_arguments()
-    
-    default_model = "anthropic.claude-3-sonnet-20240229-v1:0"
+def check_web_search_availability(web_search_requested):
+    """
+    Check if web search is available based on environment variables and user request.
+    Returns whether web search should be enabled.
+    """
+    if not web_search_requested:
+        return False
 
+    perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+    if not perplexity_api_key:
+        console.print("[yellow]Web search feature is not available: PERPLEXITY_API_KEY environment variable is not set.[/]")
+        console.print("[yellow]Continuing in normal mode...[/]")
+        return False
+
+    return True
+
+def main():
+    is_authenticated, region, error_message = check_aws_authentication()
+
+    if not is_authenticated:
+        console.print(f"[bold red]AWS Authentication Error: {error_message}[/]")
+        sys.exit(1)
+
+    console.print(f"[bold green]Authenticated with AWS in region: {region}[/]")
+
+    args = parse_arguments()
+    web_search_enabled = check_web_search_availability(args.web_search)
+    system_default_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    
     if args.model_select:
         if args.model_select == 'show_menu':
-            selected_model = select_model()
-        elif args.model_select in get_model_list():
+            selected_model = select_model(debug=args.debug)
+        elif args.model_select in get_model_list(debug=args.debug):
             selected_model = args.model_select
         else:
             print(f"Invalid model: {args.model_select}")
-            selected_model = select_model()
+            selected_model = select_model(debug=args.debug)
     else:
-        selected_model = default_model
+        # Check for user-defined default model
+        user_default = get_user_default_model()
+        default_model = user_default if user_default else system_default_model
+        
+        selected_model = check_default_model(default_model, region, debug=args.debug)
 
     model_config = get_model_config(selected_model)
     friendly_name = model_config["friendly_name"]
-    client = BedrockClient()  # Initialize our Bedrock client wrapper
+    training_cutoff = model_config["training_cutoff"]
+    client = BedrockClient(region_name=region)  # Initialise Bedrock client wrapper with authenticated region
     web_search_enabled = args.web_search
 
     try:
-        # Initialize and ensure chat history directories
+        # Initialise and ensure chat history directories
         chat_history_base_dir = ensure_chat_history_dir()
         todays_chat_dir = get_todays_chat_dir(chat_history_base_dir)
 
@@ -438,7 +678,7 @@ def main():
         local_time = now.strftime("%H:%M:%S %Z")
 
         system_prompt = (f"Specifically, your model is \"{friendly_name}\". Your knowledge base was last updated "
-                        f"in July 2024. Today is {local_date}. Local time is {local_time}. You write in British "
+                        f"in {training_cutoff}. Today is {local_date}. Local time is {local_time}. You write in British "
                         f"English and you are not too quick to apologise or thank the user. You MUST format your "
                         f"responses in Markdown syntax. Use `- ` for any unnumbered bullet point lists, as per "
                         f"standard Markdown syntax.")
@@ -465,7 +705,7 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
 """
 
         console.print(f"[bold blue]{welcome}[/]")
-        
+
         while True:
             content = get_user_input()
 
@@ -523,7 +763,7 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                             response_content += f"<web-search-results> {web_search_results} </web-search-results>"
                         except Exception as e:
                             print(f"Error during web search: {e}")
-                
+
                     if response_content:
                         append_message(messages, "assistant", response_content)
                         websearch_analysis_request = ("Thank you for carrying out a web search on my behalf with Perplexity. "
