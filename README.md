@@ -1,6 +1,6 @@
 # Wilma
 
-# A CLI Chat Interface for Claude Models via AWS Bedrock
+# A CLI Chat Interface for Anthropic's Claude LLMs via Amazon Bedrock
 
 A powerful command-line interface for interacting with Anthropic's Claude models through Amazon Bedrock. Wilma provides a feature-rich, user-friendly experience with support for multiline inputs, file analysis, and chat history management.
 
@@ -14,10 +14,12 @@ A powerful command-line interface for interacting with Anthropic's Claude models
 - **Advanced Capabilities**
   - Multiline input support for detailed prompts
   - Real-time streaming responses
-  - File and directory analysis (`Upload: ~/path/to/file`)
+  - Supports uploading individual files by entering "Upload: ~/path/to/file_name"
+  - Supports uploading an entire directory and its contents recursively by entering "Upload: ~/path/to/directory"
   - Chat history management with conversation resumption
   - Optional web search integration via Perplexity API
   - Markdown-formatted responses
+  - Optional user configuration file for setting your preferred default model.
 
 - **Developer-Friendly**
   - Comprehensive error handling
@@ -28,11 +30,19 @@ A powerful command-line interface for interacting with Anthropic's Claude models
 
 ## Prerequisites
 
-- Python 3.10 or higher
 - AWS account with Bedrock access
 - AWS CLI configured with appropriate credentials
-- `tree` command-line utility
 - Perplexity API key for optional web search feature
+
+### Apps and libraries: 
+  - Python 3.10 or higher
+  - `anthropic` Python package
+  - `anthropic[bedrock]` Python package
+  - `prompt_toolkit` Python package
+  - `rich` Python package
+  - `tiktoken` Python package
+  - `halo` Python package
+  - `tree` command-line utility
 
 ## Installation
 
@@ -71,14 +81,42 @@ chmod +x app/wilma.py
 ### Command Line Options
 
 ```bash
-./wilma.py [-h] [-m [MODEL]] [-ws]
+wilma.py [-h] [-m [MODEL]] [-ws] [--debug]
 
 options:
-  -h, --help            show help message
+  -h, --help            show this help message and exit
   -m [MODEL], --model-select [MODEL]
-                        Select AI model or show model menu
-  -ws, --web-search     Enable web search functionality
-  ```
+                        Select the Anthropic (via Amazon Bedrock) model to use. Options:
+                          - Specify a model name directly
+                          - Use without a value to select from a list of models available in your authenticated AWS region
+                          - Omit to use the default model (claude-3-5-sonnet-20241022)
+  -ws, --web-search     Enable web search functionality for answering queries.
+  --debug               Enable debug output
+```
+
+### Model Selection
+
+By default, wilma will attempt to use the Claude 3.5 Sonnet v2 model. You can:
+
+- Use the `-m` or `--model-select` argument to choose a different model
+- Create a config file to set your own default model (see Configuration section below)
+
+If the default model (either system default or your configured default) is not available in your region or you lack permissions to access it, wilma will automatically fall back to showing you a list of available models to choose from.
+
+### Configuration
+
+You can optionally create a configuration file at `~/.wilma/config` to set your preferred default model. The file should contain a line in the following format:
+
+```
+default_model = "anthropic.model-name"
+```
+
+For example:
+```
+default_model = "anthropic.claude-3-5-haiku-20240307-v1:0"
+```
+
+If the config file doesn't exist or doesn't contain a valid default_model setting, wilma will use its built-in default model.
 
 ### File Analysis
 

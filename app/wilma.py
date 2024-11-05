@@ -24,7 +24,7 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 from typing import Optional, Tuple
 
-from model_config import get_available_models, get_model_list, get_model_config
+from model_config import check_model_access, get_available_models, get_model_list, get_model_config
 
 console = Console(highlight=False)
 current_chat_file = None
@@ -242,7 +242,6 @@ def save_chat(chat_data, chat_dir):
         json.dump(chat_data, f, ensure_ascii=False, indent=4)
 
 def load_chat(file_path):
-
     """Loads chat data from a file."""
     with open(file_path, 'r', encoding='utf-8') as f:
         return json.load(f)
@@ -421,7 +420,7 @@ def select_model(debug=False):
                 console.print("[bold red]No Anthropic models are currently available in your region or you lack permissions to access them.[/]")
                 sys.exit(1)
             spinner.stop()
-            
+
         console.print("[bold blue]\nAvailable models:[/]")
         for idx, model in enumerate(models, 1):
             friendly_name = get_model_config(model)["friendly_name"]
@@ -446,10 +445,90 @@ def select_model(debug=False):
         console.print(f"[bold red]Error selecting model: {e}[/]")
         sys.exit(1)
 
+def check_default_model(default_model, region, debug=False):
+    """
+    Check if the default model is available and accessible.
+    If not, fall back to model selection.
+    """
+    with Halo(text='Checking default model...', spinner='dots') as spinner:
+        runtime_client = boto3.client('bedrock-runtime', region_name=region)
+        if not get_model_config(default_model):
+            spinner.stop()
+            console.print("[yellow]Default model not configured. Falling back to model selection...[/]")
+            return select_model(debug=debug)
+
+        if check_model_access(runtime_client, default_model, debug):
+            return default_model
+
+        spinner.stop()
+        console.print("[yellow]Default model not available. Falling back to model selection...[/]")
+        return select_model(debug=debug)
+
+def get_user_default_model():
+    """
+    Check for a user-defined default model in ~/.wilma/config.
+    Returns the model name if found and valid, None otherwise.
+    """
+    config_path = os.path.expanduser("~/.wilma/config")
+
+    # If config doesn't exist, silently return None
+    if not os.path.exists(config_path):
+        return None
+
+    try:
+        # Check if file is readable
+        if not os.access(config_path, os.R_OK):
+            console.print("[yellow]Warning: ~/.wilma/config exists but is not readable[/]")
+            return None
+
+        # Check file size
+        if os.path.getsize(config_path) > 1024:  # Arbitrary 1KB limit
+            console.print("[yellow]Warning: ~/.wilma/config is suspiciously large[/]")
+            return None
+
+        with open(config_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+
+                if line.startswith('default_model'):
+                    # Extract the model name between quotes
+                    parts = line.split('=', 1)  # Split on first = only
+                    if len(parts) != 2:
+                        continue
+
+                    model = parts[1].strip().strip('"\'')
+
+                    # Validate model name format
+                    if not model.startswith('anthropic.'):
+                        console.print("[yellow]Warning: Invalid model name format in ~/.wilma/config[/]")
+                        return None
+
+                    # Check for suspicious characters
+                    if any(char in model for char in ';&|$<>{}[]\\'):
+                        console.print("[yellow]Warning: Suspicious characters in model name in ~/.wilma/config[/]")
+                        return None
+
+                    # Optional: Check if this model exists in our known models
+                    if not get_model_config(model):
+                        console.print("[yellow]Warning: Unknown model specified in ~/.wilma/config[/]")
+                        return None
+
+                    return model
+
+        return None
+
+    except UnicodeDecodeError:
+        console.print("[yellow]Warning: ~/.wilma/config is not a valid text file[/]")
+        return None
+    except Exception as e:
+        if str(e):  # Only print if there's an actual error message
+            console.print(f"[yellow]Warning: Error reading ~/.wilma/config: {str(e)}[/]")
+        return None
+
 def parse_arguments():
-    available_models = get_available_models()
-    model_list_str = "\n".join(f"  - {model}" for model in available_models)
-    
     parser = argparse.ArgumentParser(
         description=("Universal Chatbot - Chat with Anthropic's Claude models "
             "\nUse your own Anthropic API key to chat with their latest LLMs."),
@@ -460,12 +539,10 @@ def parse_arguments():
         nargs='?',
         const='show_menu',
         metavar="MODEL",
-        help="Select the AI model to use. Options:\n"
+        help="Select the Anthropic (via Amazon Bedrock) model to use. Options:\n"
              "  - Specify a model name directly\n"
-             "  - Use without a value to show the model selection menu\n"
+             "  - Use without a value to select from a list of models available in your authenticated AWS region\n"
              "  - Omit to use the default model (claude-3-5-sonnet-20241022)\n"
-             "Available models:\n" +
-             model_list_str
     )
     parser.add_argument(
         "-ws", "--web-search",
@@ -552,8 +629,8 @@ def main():
 
     args = parse_arguments()
 
-    default_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
-
+    system_default_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    
     if args.model_select:
         if args.model_select == 'show_menu':
             selected_model = select_model(debug=args.debug)
@@ -563,7 +640,11 @@ def main():
             print(f"Invalid model: {args.model_select}")
             selected_model = select_model(debug=args.debug)
     else:
-        selected_model = default_model
+        # Check for user-defined default model
+        user_default = get_user_default_model()
+        default_model = user_default if user_default else system_default_model
+        
+        selected_model = check_default_model(default_model, region, debug=args.debug)
 
     model_config = get_model_config(selected_model)
     friendly_name = model_config["friendly_name"]

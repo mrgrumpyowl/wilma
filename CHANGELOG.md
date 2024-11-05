@@ -11,6 +11,9 @@ Dates in this file are in format of YYYY-MM-DD (2019-12-13 means 13th of Decembe
 
 ### Added
 * Athentication checking and confirmation on program start, along with some more graceful error handling. [@mrgrumpyowl](https://github.com/mrgrumpyowl)
+* Dynamic model selection list - only Anthropic models that are actively available to the authenticated user in the current AWS region are listed for selection. [@mrgrumpyowl](https://github.com/mrgrumpyowl)
+* Support for a user defined default model in an optional `~/.wilma/config` file. [@mrgrumpyowl](https://github.com/mrgrumpyowl)
+* Support for all Anthropic models currently available on Amazon Bedrock. (This is obviously subject to the availability of models in any given AWS region and the user being granted access to those models where available.) [@mrgrumpyowl](https://github.com/mrgrumpyowl)
 
 ## [[0.1.0]](https://github.com/mrgrumpyowl/wilma/releases/tag/0.1.0) - 2024-10-28
 

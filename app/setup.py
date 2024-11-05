@@ -26,16 +26,18 @@ setup(
         "Programming Language :: Python :: Implementation :: PyPy",
     ],
     install_requires=[
-      "requests",
-      "tiktoken",
-      "anthropic",
-      "prompt_toolkit",
-      "rich",
-      "boto3",
+        "anthropic",
+        "boto3",
+        "botocore",
+        "halo",
+        "prompt_toolkit",
+        "rich",
+        "requests",
+        "tiktoken",
     ],
     entry_points={
         "console_scripts": [
-            "chatbot = chatbot:main",
+            "wilma = wilma:main",
         ],
     },
 )
