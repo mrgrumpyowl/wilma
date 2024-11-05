@@ -13,6 +13,7 @@ import tiktoken
 import time
 
 from datetime import datetime
+from halo import Halo
 from prompt_toolkit import prompt
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import HTML
@@ -23,7 +24,7 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 from typing import Optional, Tuple
 
-from model_config import get_model_list, get_model_config
+from model_config import get_available_models, get_model_list, get_model_config
 
 console = Console(highlight=False)
 current_chat_file = None
@@ -37,7 +38,7 @@ def check_aws_authentication() -> Tuple[bool, Optional[str], Optional[str]]:
         # Try to get the default session credentials
         session = boto3.Session()
         credentials = session.get_credentials()
-        
+
         if not credentials:
             # Check if credentials file exists but no active session
             if os.path.exists(os.path.expanduser('~/.aws/credentials')):
@@ -46,18 +47,18 @@ def check_aws_authentication() -> Tuple[bool, Optional[str], Optional[str]]:
                                    "e.g. If using Leapp, run 'leapp session start' to start a new session.")
             else:
                 return False, None, "No AWS credentials found. Please run 'aws configure' to set up your credentials."
-        
+
         # Get the current region
         region = session.region_name
         if not region:
             return False, None, "No AWS region configured. Please run 'aws configure' to set up your region."
-            
+
         # Verify session is active by making a simple API call
         try:
             sts = session.client('sts')
             identity = sts.get_caller_identity()
             return True, region, None
-            
+
         except botocore.exceptions.ClientError as e:
             if 'expired' in str(e).lower():
                 return False, None, ("AWS session has expired.\n"
@@ -68,7 +69,7 @@ def check_aws_authentication() -> Tuple[bool, Optional[str], Optional[str]]:
                                    "Please ensure you have the necessary IAM permissions for Bedrock.")
             else:
                 return False, None, f"AWS authentication error: {str(e)}"
-                
+
     except botocore.exceptions.ProfileNotFound:
         return False, None, ("AWS profile not found.\n"
                            "If using Leapp, ensure you have an active session. "
@@ -82,9 +83,20 @@ def check_aws_authentication() -> Tuple[bool, Optional[str], Optional[str]]:
             return False, None, "No AWS credentials found. Please run 'aws configure' to set up your credentials."
 
 class BedrockClient:
-    def __init__(self, region_name='us-west-2'):
+    def __init__(self, region_name=None):
+        """
+        Initialise the Bedrock client with dynamic region handling
+        """
         try:
+            if not region_name:
+                session = boto3.Session()
+                region_name = session.region_name
+                if not region_name:
+                    raise RuntimeError("No AWS region configured. Please configure your AWS region.")
+
             self.client = boto3.client('bedrock-runtime', region_name=region_name)
+            self.region = region_name  # Store the region for reference
+
         except botocore.exceptions.ClientError as e:
             if e.response['Error']['Code'] == 'AccessDeniedException':
                 raise RuntimeError("Access denied to Bedrock. Please check your IAM permissions.")
@@ -228,6 +240,7 @@ def save_chat(chat_data, chat_dir):
 
     with open(current_chat_file, 'w', encoding='utf-8') as f:
         json.dump(chat_data, f, ensure_ascii=False, indent=4)
+
 def load_chat(file_path):
 
     """Loads chat data from a file."""
@@ -395,24 +408,48 @@ def should_exit(content: str) -> bool:
 def append_message(messages: list, role: str, content: str):
     messages.append({"role": role, "content": content})
 
-def select_model():
-    models = get_model_list()
-    console.print("[bold blue]\nAvailable models:[/]")
-    for idx, model in enumerate(models, 1):
-        friendly_name = get_model_config(model)["friendly_name"]
-        console.print(f"[bold blue]{idx}) {friendly_name}[/]")
+def select_model(debug=False):
+    """
+    Present user with a list of available Anthropic models and handle selection.
+    Only shows models that are both available in the current region and configured.
+    """
+    try:
+        with Halo(text='Checking Anthropic models available to you in this region...', spinner='dots') as spinner:
+            models = get_available_models(debug=debug)
+            if not models:
+                spinner.stop()
+                console.print("[bold red]No Anthropic models are currently available in your region or you lack permissions to access them.[/]")
+                sys.exit(1)
+            spinner.stop()
+            
+        console.print("[bold blue]\nAvailable models:[/]")
+        for idx, model in enumerate(models, 1):
+            friendly_name = get_model_config(model)["friendly_name"]
+            console.print(f"[bold blue]{idx}) {friendly_name}[/]")
 
-    while True:
-        try:
-            choice = int(input("\nSelect a model (enter the number): "))
-            if 1 <= choice <= len(models):
-                return models[choice - 1]
-            else:
-                print("Invalid choice. Please try again.")
-        except ValueError:
-            print("Invalid input. Please enter a number.")
+        while True:
+            try:
+                choice = int(input("\nSelect a model (enter the number): "))
+                if 1 <= choice <= len(models):
+                    return models[choice - 1]
+                else:
+                    print("Invalid choice. Please try again.")
+            except ValueError:
+                print("Invalid input. Please enter a number.")
+            except KeyboardInterrupt:
+                print("\nInterrupted by user")
+                try:
+                    sys.exit(0)
+                except SystemExit:
+                    os._exit(0)
+    except Exception as e:
+        console.print(f"[bold red]Error selecting model: {e}[/]")
+        sys.exit(1)
 
 def parse_arguments():
+    available_models = get_available_models()
+    model_list_str = "\n".join(f"  - {model}" for model in available_models)
+    
     parser = argparse.ArgumentParser(
         description=("Universal Chatbot - Chat with Anthropic's Claude models "
             "\nUse your own Anthropic API key to chat with their latest LLMs."),
@@ -428,12 +465,17 @@ def parse_arguments():
              "  - Use without a value to show the model selection menu\n"
              "  - Omit to use the default model (claude-3-5-sonnet-20241022)\n"
              "Available models:\n" +
-             "\n".join(f"  - {model}" for model in get_model_list())
+             model_list_str
     )
     parser.add_argument(
         "-ws", "--web-search",
         action='store_true',
         help="Enable web search functionality for answering queries."
+    )
+    parser.add_argument(
+        "--debug",
+        action='store_true',
+        help="Enable debug output"
     )
     return parser.parse_args()
 
@@ -514,22 +556,23 @@ def main():
 
     if args.model_select:
         if args.model_select == 'show_menu':
-            selected_model = select_model()
-        elif args.model_select in get_model_list():
+            selected_model = select_model(debug=args.debug)
+        elif args.model_select in get_model_list(debug=args.debug):
             selected_model = args.model_select
         else:
             print(f"Invalid model: {args.model_select}")
-            selected_model = select_model()
+            selected_model = select_model(debug=args.debug)
     else:
         selected_model = default_model
 
     model_config = get_model_config(selected_model)
     friendly_name = model_config["friendly_name"]
-    client = BedrockClient()  # Initialize our Bedrock client wrapper
+    training_cutoff = model_config["training_cutoff"]
+    client = BedrockClient(region_name=region)  # Initialise Bedrock client wrapper with authenticated region
     web_search_enabled = args.web_search
 
     try:
-        # Initialize and ensure chat history directories
+        # Initialise and ensure chat history directories
         chat_history_base_dir = ensure_chat_history_dir()
         todays_chat_dir = get_todays_chat_dir(chat_history_base_dir)
 
@@ -538,7 +581,7 @@ def main():
         local_time = now.strftime("%H:%M:%S %Z")
 
         system_prompt = (f"Specifically, your model is \"{friendly_name}\". Your knowledge base was last updated "
-                        f"in July 2024. Today is {local_date}. Local time is {local_time}. You write in British "
+                        f"in {training_cutoff}. Today is {local_date}. Local time is {local_time}. You write in British "
                         f"English and you are not too quick to apologise or thank the user. You MUST format your "
                         f"responses in Markdown syntax. Use `- ` for any unnumbered bullet point lists, as per "
                         f"standard Markdown syntax.")
