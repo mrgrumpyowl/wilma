@@ -1,7 +1,15 @@
 MODEL_CONFIG = {
+    "anthropic.claude-3-5-sonnet-20241022-v2:0": {
+        "friendly_name": "Claude 3.5 Sonnet (Bedrock)",
+        "max_tokens": 8192,
+        "temperature": 0.5,
+        "provider": "bedrock",
+        "supports_system_message": True,
+        "supports_streaming": True,
+    },
     "anthropic.claude-3-sonnet-20240229-v1:0": {
         "friendly_name": "Claude 3 Sonnet (Bedrock)",
-        "max_tokens": 8192,
+        "max_tokens": 4096,
         "temperature": 0.5,
         "provider": "bedrock",
         "supports_system_message": True,

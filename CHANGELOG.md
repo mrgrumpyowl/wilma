@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Dates in this file are in format of YYYY-MM-DD (2019-12-13 means 13th of December 2019).
 
+## [[0.2.0]](https://github.com/mrgrumpyowl/wilma/releases/tag/0.2.0) - 2024-11-05
+
+### Added
+* Athentication checking and confirmation on program start, along with some more graceful error handling. [@mrgrumpyowl](https://github.com/mrgrumpyowl)
 
 ## [[0.1.0]](https://github.com/mrgrumpyowl/wilma/releases/tag/0.1.0) - 2024-10-28
 

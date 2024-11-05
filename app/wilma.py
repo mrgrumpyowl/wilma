@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 
 import argparse
+import boto3
+import botocore
 import fnmatch
 import json
 import os
 import requests
 import sys
+import subprocess
 import tiktoken
 import time
-import subprocess
-import boto3
 
 from datetime import datetime
 from prompt_toolkit import prompt
@@ -20,65 +21,155 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.rule import Rule
+from typing import Optional, Tuple
 
 from model_config import get_model_list, get_model_config
 
 console = Console(highlight=False)
 current_chat_file = None
 
-class BedrockClient:
-    def __init__(self, region_name='eu-west-2'):
-        self.client = boto3.client('bedrock-runtime', region_name=region_name)
+def check_aws_authentication() -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Check if the user has an active AWS session and get their region.
+    Returns a tuple of (is_authenticated, region, error_message)
+    """
+    try:
+        # Try to get the default session credentials
+        session = boto3.Session()
+        credentials = session.get_credentials()
         
-    def create_message(self, model_id, messages, system=None, max_tokens=None, temperature=None, stream=False):
-        # Filter out empty messages and format them correctly for Bedrock
-        formatted_messages = []
-        for msg in messages:
-            if msg.get("content"):  # Only include messages with content
-                formatted_messages.append({
-                    "role": msg["role"],
-                    "content": [{
-                        "type": "text",
-                        "text": msg["content"]
-                    }]
-                })
-
-        # Construct request body according to Bedrock's requirements
-        request_body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "messages": formatted_messages,
-            "max_tokens": max_tokens or 4096,
-            "temperature": temperature or 0.7
-        }
+        if not credentials:
+            # Check if credentials file exists but no active session
+            if os.path.exists(os.path.expanduser('~/.aws/credentials')):
+                return False, None, ("No active AWS session found.\n"
+                                   "Please start a new AWS session using Leapp or saml2aws (etc).\n"
+                                   "e.g. If using Leapp, run 'leapp session start' to start a new session.")
+            else:
+                return False, None, "No AWS credentials found. Please run 'aws configure' to set up your credentials."
         
-        if system:
-            request_body["system"] = system
-
-        # Convert to JSON string
-        body = json.dumps(request_body)
-        
-        if stream:
-            response = self.client.invoke_model_with_response_stream(
-                modelId=model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=body
-            )
-            return BedrockStreamWrapper(response)
+        # Get the current region
+        region = session.region_name
+        if not region:
+            return False, None, "No AWS region configured. Please run 'aws configure' to set up your region."
+            
+        # Verify session is active by making a simple API call
+        try:
+            sts = session.client('sts')
+            identity = sts.get_caller_identity()
+            return True, region, None
+            
+        except botocore.exceptions.ClientError as e:
+            if 'expired' in str(e).lower():
+                return False, None, ("AWS session has expired.\n"
+                                   "Please refresh your session using Leapp or saml2aws (etc).\n"
+                                   "e.g. If using Leapp, run 'leapp session start' to start a new session.")
+            elif 'not authorized' in str(e).lower():
+                return False, None, ("Your AWS credentials don't have the required permissions.\n"
+                                   "Please ensure you have the necessary IAM permissions for Bedrock.")
+            else:
+                return False, None, f"AWS authentication error: {str(e)}"
+                
+    except botocore.exceptions.ProfileNotFound:
+        return False, None, ("AWS profile not found.\n"
+                           "If using Leapp, ensure you have an active session. "
+                           "Run 'leapp session start' to start a new session.")
+    except botocore.exceptions.NoCredentialsError:
+        if os.path.exists(os.path.expanduser('~/.aws/credentials')):
+            return False, None, ("Found AWS credentials but no active session.\n"
+                               "Please start a new AWS session using Leapp or saml2aws (etc).\n"
+                               "e.g. If using Leapp, run 'leapp session start' to start a new session.")
         else:
-            response = self.client.invoke_model(
-                modelId=model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=body
-            )
-            response_body = json.loads(response.get('body').read())
-            return BedrockResponseWrapper(response_body)
+            return False, None, "No AWS credentials found. Please run 'aws configure' to set up your credentials."
+
+class BedrockClient:
+    def __init__(self, region_name='us-west-2'):
+        try:
+            self.client = boto3.client('bedrock-runtime', region_name=region_name)
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'AccessDeniedException':
+                raise RuntimeError("Access denied to Bedrock. Please check your IAM permissions.")
+            elif e.response['Error']['Code'] == 'UnrecognizedClientException':
+                raise RuntimeError("Invalid AWS credentials. Please check your AWS configuration.")
+            else:
+                raise RuntimeError(f"Error initializing Bedrock client: {str(e)}")
+        except botocore.exceptions.EndpointConnectionError:
+            raise RuntimeError(f"Could not connect to Bedrock in region {region_name}. Please check if Bedrock is available in this region.")
+
+    def create_message(self, model_id, messages, system=None, max_tokens=None, temperature=None, stream=False):
+        try:
+            # Filter out empty messages and format them correctly for Bedrock
+            formatted_messages = []
+            for msg in messages:
+                if msg.get("content"):  # Only include messages with content
+                    formatted_messages.append({
+                        "role": msg["role"],
+                        "content": [{
+                            "type": "text",
+                            "text": msg["content"]
+                        }]
+                    })
+
+            # Construct request body according to Bedrock's requirements
+            request_body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "messages": formatted_messages,
+                "max_tokens": max_tokens or 4096,
+                "temperature": temperature or 0.7
+            }
+
+            if system:
+                request_body["system"] = system
+
+            # Convert to JSON string
+            body = json.dumps(request_body)
+
+            if stream:
+                try:
+                    response = self.client.invoke_model_with_response_stream(
+                        modelId=model_id,
+                        contentType="application/json",
+                        accept="application/json",
+                        body=body
+                    )
+                    return BedrockStreamWrapper(response)
+                except botocore.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] == 'ModelNotFound':
+                        available_models = self._get_available_models()
+                        raise RuntimeError(f"Model {model_id} not found. Available models: {', '.join(available_models)}")
+                    raise RuntimeError(f"Error streaming from model: {str(e)}")
+            else:
+                try:
+                    response = self.client.invoke_model(
+                        modelId=model_id,
+                        contentType="application/json",
+                        accept="application/json",
+                        body=body
+                    )
+                    response_body = json.loads(response.get('body').read())
+                    return BedrockResponseWrapper(response_body)
+                except botocore.exceptions.ClientError as e:
+                    if e.response['Error']['Code'] == 'ModelNotFound':
+                        available_models = self._get_available_models()
+                        raise RuntimeError(f"Model {model_id} not found. Available models: {', '.join(available_models)}")
+                    raise RuntimeError(f"Error invoking model: {str(e)}")
+
+        except json.JSONDecodeError:
+            raise RuntimeError("Error parsing model response")
+        except Exception as e:
+            raise RuntimeError(f"Unexpected error creating message: {str(e)}")
+
+    def _get_available_models(self) -> list:
+        try:
+            bedrock = boto3.client('bedrock')
+            response = bedrock.list_foundation_models()
+            return [model['modelId'] for model in response['modelSummaries']]
+        except Exception:
+            return []  # Return empty list if we can't get models
 
 class BedrockStreamWrapper:
     def __init__(self, stream_response):
         self.stream = stream_response.get('body')
-        
+
     def __iter__(self):
         for event in self.stream:
             chunk = json.loads(event['chunk']['bytes'].decode())
@@ -91,7 +182,7 @@ class BedrockChunkWrapper:
             self.type = chunk['type']
         else:
             self.type = 'content_block_delta'
-        
+
         if 'delta' in chunk:
             self.delta = BedrockDeltaWrapper(chunk['delta'])
         else:
@@ -112,6 +203,7 @@ class BedrockResponseWrapper:
 class BedrockContentWrapper:
     def __init__(self, response):
         self.text = response.get('text', '')
+
 def ensure_chat_history_dir():
     """Ensures that the chat history base directory exists."""
     home_dir = os.path.expanduser("~")
@@ -309,7 +401,7 @@ def select_model():
     for idx, model in enumerate(models, 1):
         friendly_name = get_model_config(model)["friendly_name"]
         console.print(f"[bold blue]{idx}) {friendly_name}[/]")
-    
+
     while True:
         try:
             choice = int(input("\nSelect a model (enter the number): "))
@@ -373,9 +465,9 @@ def perform_web_search(query):
         ],
         "temperature": 0.3
     }
-    
+
     response = requests.request("POST", url, json=payload, headers=headers)
-    
+
     if response.status_code == 200:
         content = response.json()['choices'][0]['message']['content'].strip()
         return f"Found online today, {local_date}, at time {local_time}: {content}"
@@ -408,9 +500,17 @@ def should_perform_web_search(content, selected_model, model_config, client):
         return False, ""
 
 def main():
+    is_authenticated, region, error_message = check_aws_authentication()
+
+    if not is_authenticated:
+        console.print(f"[bold red]AWS Authentication Error: {error_message}[/]")
+        sys.exit(1)
+
+    console.print(f"[bold green]Authenticated with AWS in region: {region}[/]")
+
     args = parse_arguments()
-    
-    default_model = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+    default_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 
     if args.model_select:
         if args.model_select == 'show_menu':
@@ -465,7 +565,7 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
 """
 
         console.print(f"[bold blue]{welcome}[/]")
-        
+
         while True:
             content = get_user_input()
 
@@ -523,7 +623,7 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                             response_content += f"<web-search-results> {web_search_results} </web-search-results>"
                         except Exception as e:
                             print(f"Error during web search: {e}")
-                
+
                     if response_content:
                         append_message(messages, "assistant", response_content)
                         websearch_analysis_request = ("Thank you for carrying out a web search on my behalf with Perplexity. "
