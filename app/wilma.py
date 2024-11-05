@@ -618,6 +618,22 @@ def should_perform_web_search(content, selected_model, model_config, client):
     else:
         return False, ""
 
+def check_web_search_availability(web_search_requested):
+    """
+    Check if web search is available based on environment variables and user request.
+    Returns whether web search should be enabled.
+    """
+    if not web_search_requested:
+        return False
+
+    perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+    if not perplexity_api_key:
+        console.print("[yellow]Web search feature is not available: PERPLEXITY_API_KEY environment variable is not set.[/]")
+        console.print("[yellow]Continuing in normal mode...[/]")
+        return False
+
+    return True
+
 def main():
     is_authenticated, region, error_message = check_aws_authentication()
 
@@ -628,7 +644,7 @@ def main():
     console.print(f"[bold green]Authenticated with AWS in region: {region}[/]")
 
     args = parse_arguments()
-
+    web_search_enabled = check_web_search_availability(args.web_search)
     system_default_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
     
     if args.model_select:
