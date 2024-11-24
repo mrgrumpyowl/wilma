@@ -91,6 +91,21 @@ class MaxRetriesExceeded(BedrockClientError):
     """Raised when max retries are exceeded"""
     pass
 
+class TokenExpiredException(BedrockClientError):
+    """Raised when the AWS token has expired"""
+    pass
+
+def handle_expired_token_retry():
+    """Handle expired token by prompting user to reauthenticate and retry"""
+    print("\nYour AWS authentication token has expired.")
+    print("Please reauthenticate using your preferred method (e.g., 'leapp session start' or saml2aws)")
+    try:
+        input("\nPress ENTER to retry after reauthenticating, or CTRL+C to exit...")
+        return True
+    except KeyboardInterrupt:
+        print("\nExiting...")
+        sys.exit(0)
+
 class BedrockStreamWrapper:
     """Wraps the Bedrock stream response to handle streaming content"""
     def __init__(self, stream_response):
@@ -152,14 +167,20 @@ class RetryingStreamIterator:
 
     def _create_new_stream(self):
         """Create a new stream from the Bedrock client"""
-        response = self.client.invoke_model_with_response_stream(
-            modelId=self.model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(self.request_body)
-        )
-        self.current_stream = BedrockStreamWrapper(response)
-        self.current_iterator = iter(self.current_stream)
+        try:
+            response = self.client.invoke_model_with_response_stream(
+                modelId=self.model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(self.request_body)
+            )
+            self.current_stream = BedrockStreamWrapper(response)
+            self.current_iterator = iter(self.current_stream)
+        except botocore.exceptions.ClientError as e:
+            if 'ExpiredToken' in str(e) or 'expired' in str(e).lower():
+                raise TokenExpiredException("AWS token has expired")
+            raise
+
 
     def __iter__(self):
         return self
@@ -174,6 +195,9 @@ class RetryingStreamIterator:
 
             except StopIteration:
                 raise
+
+            except TokenExpiredException:
+                raise  # Let the caller handle token expiration
 
             except (botocore.exceptions.EventStreamError, Exception) as e:
                 if 'serviceunavailableexception' in str(e).lower():
@@ -217,7 +241,7 @@ class BedrockClient:
     def create_message(self, model_id: str, messages: list, system: Optional[str] = None,
                       max_tokens: Optional[int] = None, temperature: Optional[float] = None,
                       stream: bool = False):
-        """Create a message with retry logic for ServiceUnavailable exceptions"""
+        """Create a message with retry logic for ServiceUnavailable and ExpiredToken exceptions"""
         # Format messages for Bedrock
         formatted_messages = [
             {
@@ -260,7 +284,9 @@ class BedrockClient:
                     response_body = json.loads(response.get('body').read())
                     return BedrockResponseWrapper(response_body)
                 
-                except Exception as e:
+                except botocore.exceptions.ClientError as e:
+                    if 'ExpiredToken' in str(e) or 'expired' in str(e).lower():
+                        raise TokenExpiredException("AWS token has expired")
                     if 'serviceunavailableexception' in str(e).lower():
                         if attempt < self.max_retries:
                             delay = min(self.max_delay, self.base_delay * (2 ** attempt))
@@ -842,38 +868,55 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
 
             supports_streaming = model_config.get("supports_streaming", True)
 
-            if supports_streaming:
-                stream = client.create_message(
-                    model_id=selected_model,
-                    messages=messages,
-                    system=system_prompt,
-                    max_tokens=model_config["max_tokens"],
-                    temperature=model_config["temperature"],
-                    stream=True
-                )
+            while True:  # Retry loop for token expiration
+                try:
+                    if supports_streaming:
+                        stream = client.create_message(
+                            model_id=selected_model,
+                            messages=messages,
+                            system=system_prompt,
+                            max_tokens=model_config["max_tokens"],
+                            temperature=model_config["temperature"],
+                            stream=True
+                        )
 
-                complete_message = ""
-                with Live(Markdown(complete_message),
-                          refresh_per_second=10,
-                          console=console,
-                          transient=False) as live:
-                    for chunk in stream:
-                        if chunk.type == "content_block_delta":
-                            if chunk.delta.text:
-                                complete_message += chunk.delta.text
-                                live.update(Markdown(complete_message))
-                        elif chunk.type == "message_stop":
-                            break
-            else:
-                response = client.create_message(
-                    model_id=selected_model,
-                    messages=messages,
-                    system=system_prompt,
-                    max_tokens=model_config["max_tokens"],
-                    temperature=model_config["temperature"]
-                )
-                complete_message = response.content[0].text
-                console.print(Markdown(complete_message))
+                        complete_message = ""
+                        with Live(Markdown(complete_message),
+                                  refresh_per_second=10,
+                                  console=console,
+                                  transient=False) as live:
+                            for chunk in stream:
+                                if chunk.type == "content_block_delta":
+                                    if chunk.delta.text:
+                                        complete_message += chunk.delta.text
+                                        live.update(Markdown(complete_message))
+                                elif chunk.type == "message_stop":
+                                    break
+                    else:
+                        response = client.create_message(
+                            model_id=selected_model,
+                            messages=messages,
+                            system=system_prompt,
+                            max_tokens=model_config["max_tokens"],
+                            temperature=model_config["temperature"]
+                        )
+                        complete_message = response.content[0].text
+                        console.print(Markdown(complete_message))
+
+                    # If we get here, the message was processed successfully
+                    break
+
+                except TokenExpiredException:
+                    if handle_expired_token_retry():
+                        # Re-initialize the client with fresh credentials
+                        client = BedrockClient(
+                            region_name=region,
+                            max_retries=6,
+                            base_delay=1.0,
+                            max_delay=20.0
+                        )
+                        continue  # Retry the message
+                    sys.exit(0)  # User chose to exit
 
             append_message(messages, "assistant", complete_message)
 
