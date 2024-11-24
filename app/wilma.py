@@ -101,10 +101,44 @@ def handle_expired_token_retry():
     print("Please reauthenticate using your preferred method (e.g., 'leapp session start' or saml2aws)")
     try:
         input("\nPress ENTER to retry after reauthenticating, or CTRL+C to exit...")
-        return True
+        # Create new session and verify it
+        session = boto3.Session()
+        try:
+            sts = session.client('sts')
+            sts.get_caller_identity()
+            return True
+        except botocore.exceptions.ClientError as e:
+            if 'expired' in str(e).lower():
+                print("\nToken is still expired. Please ensure you have reauthenticated properly.")
+                return False
+            raise
     except KeyboardInterrupt:
         print("\nExiting...")
         sys.exit(0)
+
+def verify_bedrock_access(client, model_id):
+    """Verify we can access Bedrock by making a minimal API call"""
+    try:
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "test"}]}],
+            "max_tokens": 1,
+            "temperature": 0
+        }
+        
+        client.client.invoke_model(
+            modelId=model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(request_body)
+        )
+        return True
+    except botocore.exceptions.ClientError as e:
+        if 'ExpiredToken' in str(e) or 'expired' in str(e).lower():
+            return False
+        raise
+    except Exception:
+        raise
 
 class BedrockStreamWrapper:
     """Wraps the Bedrock stream response to handle streaming content"""
@@ -180,7 +214,6 @@ class RetryingStreamIterator:
             if 'ExpiredToken' in str(e) or 'expired' in str(e).lower():
                 raise TokenExpiredException("AWS token has expired")
             raise
-
 
     def __iter__(self):
         return self
@@ -908,6 +941,9 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
 
                 except TokenExpiredException:
                     if handle_expired_token_retry():
+                        # Get region from new session
+                        session = boto3.Session()
+                        region = session.region_name
                         # Re-initialize the client with fresh credentials
                         client = BedrockClient(
                             region_name=region,
@@ -915,8 +951,16 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                             base_delay=1.0,
                             max_delay=20.0
                         )
-                        continue  # Retry the message
-                    sys.exit(0)  # User chose to exit
+                        # Verify we can actually talk to Bedrock now
+                        if verify_bedrock_access(client, selected_model):
+                            print("\nSuccessfully reconnected to Bedrock. Retrying your request...")
+                            continue  # Retry the message
+                        else:
+                            print("\nStill unable to access Bedrock. Please ensure you have properly reauthenticated.")
+                            if handle_expired_token_retry():  # Give them another chance
+                                continue
+                            break  # Exit the retry loop but continue the main chat loop
+                    break  # Exit the retry loop but continue the main chat loop
 
             append_message(messages, "assistant", complete_message)
 
