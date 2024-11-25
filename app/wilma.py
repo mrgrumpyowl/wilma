@@ -96,16 +96,27 @@ class TokenExpiredException(BedrockClientError):
     pass
 
 def refresh_aws_session():
-    """Force boto3 to create a new session with fresh credentials"""
+    """
+    Force boto3 to create a new session with fresh credentials.
+    Returns (success, region_name, error_message)
+    """
     try:
         boto3.setup_default_session()  # Clear cached session
         session = boto3.Session()  # Create new session
+        
         # Verify credentials by making an STS call
         sts = session.client('sts')
         sts.get_caller_identity()
-        return session.region_name
-    except botocore.exceptions.ClientError:
-        return None
+        
+        region = session.region_name
+        if not region:
+            return False, None, "No AWS region configured. Please run 'aws configure' to set up your region."
+            
+        return True, region, None
+        
+    except (botocore.exceptions.ClientError, botocore.exceptions.NoCredentialsError) as e:
+        error_msg = f"Failed to refresh AWS session: {str(e)}"
+        return False, None, error_msg
 
 class BedrockStreamWrapper:
     """Wraps the Bedrock stream response to handle streaming content"""
@@ -868,8 +879,9 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
 
             supports_streaming = model_config.get("supports_streaming", True)
 
-            while True:  # Retry loop for token expiration
+            while True:  # Main interaction loop
                 try:
+                    # Message creation and streaming logic
                     if supports_streaming:
                         stream = client.create_message(
                             model_id=selected_model,
@@ -910,31 +922,42 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                     console.print(f"[yellow]\nYour AWS authentication token has expired.[/]")
                     console.print(f"[yellow]Please reauthenticate using your preferred method (e.g. Leapp or saml2aws)[/]")
                     
-                    while True:
+                    while True:  # Retry loop for token refresh
                         try:
                             input("\nPress ENTER to retry after reauthenticating, or CTRL+C to exit...")
                             
                             # Force refresh of AWS credentials
-                            region = refresh_aws_session()
-                            if not region:
-                                print("\nStill unable to authenticate. Please ensure you have reauthenticated properly.")
+                            success, new_region, error_msg = refresh_aws_session()
+                            if not success:
+                                console.print(f"[yellow]\n{error_msg}\nPlease ensure you have reauthenticated properly.[/]")
                                 continue
-                                
-                            # Create completely new client with fresh credentials
+                            
+                            # Create new client with fresh credentials
                             client = BedrockClient(
-                                region_name=region,
+                                region_name=new_region,
                                 max_retries=6,
                                 base_delay=1.0,
                                 max_delay=20.0
                             )
                             
+                            # Verify the new client works
+                            is_authenticated, _, auth_error = check_aws_authentication()
+                            if not is_authenticated:
+                                if auth_error:
+                                    console.print(f"[yellow]\n{auth_error}[/]")
+                                console.print("[yellow]\nFailed to establish connection with AWS. Please ensure you have reauthenticated properly.[/]")
+                                continue
+                            
                             console.print(f"[yellow]\nSuccessfully reconnected to AWS. Retrying your request...\n[/]")
-                            break  # Break out of the retry prompt loop
-
+                            break  # Break out of the token refresh retry loop
+                            
                         except KeyboardInterrupt:
                             print("\nExiting...")
                             sys.exit(0)
-                            
+                        except Exception as e:
+                            console.print(f"[yellow]\nError creating Bedrock client: {str(e)}\nPlease ensure you have reauthenticated properly.[/]")
+                            continue
+                    
                     continue  # Retry the message with new client
 
             append_message(messages, "assistant", complete_message)
