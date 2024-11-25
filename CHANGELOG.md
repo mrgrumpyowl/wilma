@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Dates in this file are in format of YYYY-MM-DD (2019-12-13 means 13th of December 2019).
 
+## [[0.3.0]](https://github.com/mrgrumpyowl/wilma/releases/tag/0.3.0) - 2024-11-25
+
+### Changed
+* Improved exception handling for `ServiceUnavailableException`; wilma now retries with exponential backoff. [@mrgrumpyowl](https://github.com/mrgrumpyowl)
+* Improved exception handling for `ExpiredTokenException`; wilma now warns the user of expired token and invites the user to re-authenticate. [@mrgrumpyowl](https://github.com/mrgrumpyowl)
+
 ## [[0.2.0]](https://github.com/mrgrumpyowl/wilma/releases/tag/0.2.0) - 2024-11-05
 
 ### Added
