@@ -95,50 +95,17 @@ class TokenExpiredException(BedrockClientError):
     """Raised when the AWS token has expired"""
     pass
 
-def handle_expired_token_retry():
-    """Handle expired token by prompting user to reauthenticate and retry"""
-    print("\nYour AWS authentication token has expired.")
-    print("Please reauthenticate using your preferred method (e.g., 'leapp session start' or saml2aws)")
+def refresh_aws_session():
+    """Force boto3 to create a new session with fresh credentials"""
     try:
-        input("\nPress ENTER to retry after reauthenticating, or CTRL+C to exit...")
-        # Create new session and verify it
-        session = boto3.Session()
-        try:
-            sts = session.client('sts')
-            sts.get_caller_identity()
-            return True
-        except botocore.exceptions.ClientError as e:
-            if 'expired' in str(e).lower():
-                print("\nToken is still expired. Please ensure you have reauthenticated properly.")
-                return False
-            raise
-    except KeyboardInterrupt:
-        print("\nExiting...")
-        sys.exit(0)
-
-def verify_bedrock_access(client, model_id):
-    """Verify we can access Bedrock by making a minimal API call"""
-    try:
-        request_body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "messages": [{"role": "user", "content": [{"type": "text", "text": "test"}]}],
-            "max_tokens": 1,
-            "temperature": 0
-        }
-        
-        client.client.invoke_model(
-            modelId=model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=json.dumps(request_body)
-        )
-        return True
-    except botocore.exceptions.ClientError as e:
-        if 'ExpiredToken' in str(e) or 'expired' in str(e).lower():
-            return False
-        raise
-    except Exception:
-        raise
+        boto3.setup_default_session()  # Clear cached session
+        session = boto3.Session()  # Create new session
+        # Verify credentials by making an STS call
+        sts = session.client('sts')
+        sts.get_caller_identity()
+        return session.region_name
+    except botocore.exceptions.ClientError:
+        return None
 
 class BedrockStreamWrapper:
     """Wraps the Bedrock stream response to handle streaming content"""
@@ -236,7 +203,7 @@ class RetryingStreamIterator:
                 if 'serviceunavailableexception' in str(e).lower():
                     if self.attempt < self.max_retries:
                         delay = self._calculate_delay()
-                        print(f"\nService unavailable. Retrying stream in {delay:.2f} seconds (attempt {self.attempt + 1}/{self.max_retries})...")
+                        console.print(f"[yellow]\nService unavailable. Retrying stream in {delay:.2f} seconds (attempt {self.attempt + 1}/{self.max_retries})...\n[/]")
                         time.sleep(delay)
                         self.attempt += 1
                         self.current_iterator = None  # Force creation of new stream
@@ -379,7 +346,7 @@ def select_chat_file(chat_history_base_dir):
         print("No previous chats available.")
         return None
 
-    console.print("[bold cyan]\nYour 20 most recent chats with Anthropic models, sorted by most recent first:[/]")
+    console.print("[bold cyan]\nYour 20 most recent chats, sorted by most recent first:[/]")
     for idx, file in enumerate(files):
         display_name = os.path.splitext(os.path.basename(file))[0]
         print(f"{idx + 1}) {display_name}")
@@ -843,8 +810,8 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                 if is_directory:
                     markdown_content, token_count = generate_markdown_from_directory(path)
                     if markdown_content == "DIRECTORY TOO BIG.":
-                        print(f"\nThe directory is too large to upload because it is likely larger than 100,000 tokens.\n"
-                              f"Estimated token count for this recursive directory analysis: {token_count}\n")
+                        console.print(f"[yellow]\nThe directory is too large to upload because it is likely larger than 100,000 tokens.\n"
+                              f"Estimated token count for this recursive directory analysis:[/] {token_count}\n")
                     if markdown_content:
                         dir_analysis_request = (f"The following describes a directory structure along with all its contents in "
                                               f"Markdown format. "
@@ -854,25 +821,25 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                                               f"assurance that you have memorised the contents of the repository and you are ready to "
                                               f"answer the user's questions.\n\n{markdown_content}")
                         append_message(messages, "user", dir_analysis_request)
-                        print(f"\nEstimated token count for this recursive directory analysis: {token_count}\n")
+                        console.print(f"[yellow]\nEstimated token count for this recursive directory analysis:[/] {token_count}\n")
                     else:
                         print_formatted_text(HTML("<ansired>Directory is empty or contains no readable files.</ansired>"))
                         continue
                 else:
                     file_name, file_contents, token_count = read_file_contents(path)
                     if file_contents == "FILE TOO BIG.":
-                        print(f"\nThe file: {file_name} is too large to upload because it is likely larger than 64,000 tokens.\n"
-                              f"Estimated token count for this file: {token_count}\n")
+                        console.print(f"[yellow]\nThe file: {file_name} is too large to upload because it is likely larger than 64,000 tokens.\n"
+                              f"Estimated token count for this file:[/] {token_count}\n")
                     elif file_contents:
                         file_analysis_request = (f"Please analyse the contents of the following file:\n"
                                                f"\n{file_name}\n"
                                                f"\n{file_contents}\n"
                                                f"\nEnd your response by asking the user what questions they have about the file.")
                         append_message(messages, "user", file_analysis_request)
-                        print(f"\nEstimated token count for this file: {token_count}\n")
+                        console.print(f"[yellow]\nEstimated token count for this file:[/] {token_count}\n")
                     else:
                         print_formatted_text(HTML(f"\nThe file: {file_name} is empty.\n"))
-                        print(f"Estimated token count for this file: {token_count}\n")
+                        console.print(f"[yellow]Estimated token count for this file:[/] {token_count}\n")
                         continue
             else:
                 append_message(messages, "user", content)
@@ -882,7 +849,7 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
 
                     response_content = ""
                     if web_search_needed:
-                        print("Web search in progress...\n")
+                        console.print(f"[yellow]Web search in progress...\n[/]")
                         try:
                             web_search_results = perform_web_search(search_query)
                             response_content += f"<web-search-results> {web_search_results} </web-search-results>"
@@ -940,27 +907,35 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                     break
 
                 except TokenExpiredException:
-                    if handle_expired_token_retry():
-                        # Get region from new session
-                        session = boto3.Session()
-                        region = session.region_name
-                        # Re-initialize the client with fresh credentials
-                        client = BedrockClient(
-                            region_name=region,
-                            max_retries=6,
-                            base_delay=1.0,
-                            max_delay=20.0
-                        )
-                        # Verify we can actually talk to Bedrock now
-                        if verify_bedrock_access(client, selected_model):
-                            print("\nSuccessfully reconnected to Bedrock. Retrying your request...")
-                            continue  # Retry the message
-                        else:
-                            print("\nStill unable to access Bedrock. Please ensure you have properly reauthenticated.")
-                            if handle_expired_token_retry():  # Give them another chance
+                    console.print(f"[yellow]\nYour AWS authentication token has expired.[/]")
+                    console.print(f"[yellow]Please reauthenticate using your preferred method (e.g. Leapp or saml2aws)[/]")
+                    
+                    while True:
+                        try:
+                            input("\nPress ENTER to retry after reauthenticating, or CTRL+C to exit...")
+                            
+                            # Force refresh of AWS credentials
+                            region = refresh_aws_session()
+                            if not region:
+                                print("\nStill unable to authenticate. Please ensure you have reauthenticated properly.")
                                 continue
-                            break  # Exit the retry loop but continue the main chat loop
-                    break  # Exit the retry loop but continue the main chat loop
+                                
+                            # Create completely new client with fresh credentials
+                            client = BedrockClient(
+                                region_name=region,
+                                max_retries=6,
+                                base_delay=1.0,
+                                max_delay=20.0
+                            )
+                            
+                            console.print(f"[yellow]\nSuccessfully reconnected to AWS. Retrying your request...\n[/]")
+                            break  # Break out of the retry prompt loop
+
+                        except KeyboardInterrupt:
+                            print("\nExiting...")
+                            sys.exit(0)
+                            
+                    continue  # Retry the message with new client
 
             append_message(messages, "assistant", complete_message)
 
