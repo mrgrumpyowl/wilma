@@ -11,10 +11,10 @@ print("Detected Packages:", find_packages())
 
 setup(
     name="wilma",
-    version="0.1.0",
+    version="0.3.0",
     description="An Anthropic Claude chatbot that uses Amazon Bedrock",
     author="Contributors",
-    url=("https://github.com/mrgrumpyowl/ai-tools.git"),
+    url=("https://github.com/mrgrumpyowl/wilma.git"),
     py_modules=["wilma", "model_config"],
     classifiers=[
         "License :: OSI Approved :: MIT License",

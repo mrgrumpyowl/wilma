@@ -6,6 +6,7 @@ import botocore
 import fnmatch
 import json
 import os
+import random
 import requests
 import sys
 import subprocess
@@ -82,103 +83,43 @@ def check_aws_authentication() -> Tuple[bool, Optional[str], Optional[str]]:
         else:
             return False, None, "No AWS credentials found. Please run 'aws configure' to set up your credentials."
 
-class BedrockClient:
-    def __init__(self, region_name=None):
-        """
-        Initialise the Bedrock client with dynamic region handling
-        """
-        try:
-            if not region_name:
-                session = boto3.Session()
-                region_name = session.region_name
-                if not region_name:
-                    raise RuntimeError("No AWS region configured. Please configure your AWS region.")
+class BedrockClientError(Exception):
+    """Base exception class for BedrockClient errors"""
+    pass
 
-            self.client = boto3.client('bedrock-runtime', region_name=region_name)
-            self.region = region_name  # Store the region for reference
+class MaxRetriesExceeded(BedrockClientError):
+    """Raised when max retries are exceeded"""
+    pass
 
-        except botocore.exceptions.ClientError as e:
-            if e.response['Error']['Code'] == 'AccessDeniedException':
-                raise RuntimeError("Access denied to Bedrock. Please check your IAM permissions.")
-            elif e.response['Error']['Code'] == 'UnrecognizedClientException':
-                raise RuntimeError("Invalid AWS credentials. Please check your AWS configuration.")
-            else:
-                raise RuntimeError(f"Error initializing Bedrock client: {str(e)}")
-        except botocore.exceptions.EndpointConnectionError:
-            raise RuntimeError(f"Could not connect to Bedrock in region {region_name}. Please check if Bedrock is available in this region.")
+class TokenExpiredException(BedrockClientError):
+    """Raised when the AWS token has expired"""
+    pass
 
-    def create_message(self, model_id, messages, system=None, max_tokens=None, temperature=None, stream=False):
-        try:
-            # Filter out empty messages and format them correctly for Bedrock
-            formatted_messages = []
-            for msg in messages:
-                if msg.get("content"):  # Only include messages with content
-                    formatted_messages.append({
-                        "role": msg["role"],
-                        "content": [{
-                            "type": "text",
-                            "text": msg["content"]
-                        }]
-                    })
-
-            # Construct request body according to Bedrock's requirements
-            request_body = {
-                "anthropic_version": "bedrock-2023-05-31",
-                "messages": formatted_messages,
-                "max_tokens": max_tokens or 4096,
-                "temperature": temperature or 0.7
-            }
-
-            if system:
-                request_body["system"] = system
-
-            # Convert to JSON string
-            body = json.dumps(request_body)
-
-            if stream:
-                try:
-                    response = self.client.invoke_model_with_response_stream(
-                        modelId=model_id,
-                        contentType="application/json",
-                        accept="application/json",
-                        body=body
-                    )
-                    return BedrockStreamWrapper(response)
-                except botocore.exceptions.ClientError as e:
-                    if e.response['Error']['Code'] == 'ModelNotFound':
-                        available_models = self._get_available_models()
-                        raise RuntimeError(f"Model {model_id} not found. Available models: {', '.join(available_models)}")
-                    raise RuntimeError(f"Error streaming from model: {str(e)}")
-            else:
-                try:
-                    response = self.client.invoke_model(
-                        modelId=model_id,
-                        contentType="application/json",
-                        accept="application/json",
-                        body=body
-                    )
-                    response_body = json.loads(response.get('body').read())
-                    return BedrockResponseWrapper(response_body)
-                except botocore.exceptions.ClientError as e:
-                    if e.response['Error']['Code'] == 'ModelNotFound':
-                        available_models = self._get_available_models()
-                        raise RuntimeError(f"Model {model_id} not found. Available models: {', '.join(available_models)}")
-                    raise RuntimeError(f"Error invoking model: {str(e)}")
-
-        except json.JSONDecodeError:
-            raise RuntimeError("Error parsing model response")
-        except Exception as e:
-            raise RuntimeError(f"Unexpected error creating message: {str(e)}")
-
-    def _get_available_models(self) -> list:
-        try:
-            bedrock = boto3.client('bedrock')
-            response = bedrock.list_foundation_models()
-            return [model['modelId'] for model in response['modelSummaries']]
-        except Exception:
-            return []  # Return empty list if we can't get models
+def refresh_aws_session():
+    """
+    Force boto3 to create a new session with fresh credentials.
+    Returns (success, region_name, error_message)
+    """
+    try:
+        boto3.setup_default_session()  # Clear cached session
+        session = boto3.Session()  # Create new session
+        
+        # Verify credentials by making an STS call
+        sts = session.client('sts')
+        sts.get_caller_identity()
+        
+        region = session.region_name
+        if not region:
+            return False, None, "No AWS region configured. Please run 'aws configure' to set up your region."
+            
+        return True, region, None
+        
+    except (botocore.exceptions.ClientError, botocore.exceptions.NoCredentialsError) as e:
+        error_msg = f"Failed to refresh AWS session: {str(e)}"
+        return False, None, error_msg
 
 class BedrockStreamWrapper:
+    """Wraps the Bedrock stream response to handle streaming content"""
     def __init__(self, stream_response):
         self.stream = stream_response.get('body')
 
@@ -188,8 +129,8 @@ class BedrockStreamWrapper:
             yield BedrockChunkWrapper(chunk)
 
 class BedrockChunkWrapper:
+    """Wraps individual chunks from the stream"""
     def __init__(self, chunk):
-        # Handle the Bedrock streaming response format
         if 'type' in chunk:
             self.type = chunk['type']
         else:
@@ -198,23 +139,179 @@ class BedrockChunkWrapper:
         if 'delta' in chunk:
             self.delta = BedrockDeltaWrapper(chunk['delta'])
         else:
-            # Handle the case where we get the full content
             content = chunk.get('content', [{'text': ''}])[0]
             self.delta = BedrockDeltaWrapper({'text': content.get('text', '')})
 
 class BedrockDeltaWrapper:
+    """Wraps the delta content from chunks"""
     def __init__(self, delta):
         self.text = delta.get('text', '')
 
 class BedrockResponseWrapper:
+    """Wraps non-streaming responses"""
     def __init__(self, response):
-        # Extract the text content from the Bedrock response format
         content = response.get('content', [{'text': ''}])[0]
         self.content = [BedrockContentWrapper({'text': content.get('text', '')})]
 
 class BedrockContentWrapper:
+    """Wraps content from non-streaming responses"""
     def __init__(self, response):
         self.text = response.get('text', '')
+
+class RetryingStreamIterator:
+    """Implements retry logic for streaming responses"""
+    def __init__(self, client, model_id, request_body, max_retries=3, base_delay=1.0, max_delay=20.0):
+        self.client = client
+        self.model_id = model_id
+        self.request_body = request_body
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.attempt = 0
+        self.current_stream = None
+        self.current_iterator = None
+
+    def _calculate_delay(self) -> float:
+        """Calculate delay with exponential backoff and jitter"""
+        exp_delay = min(self.max_delay, self.base_delay * (2 ** self.attempt))
+        jitter = random.uniform(0, 0.1 * exp_delay)
+        return exp_delay + jitter
+
+    def _create_new_stream(self):
+        """Create a new stream from the Bedrock client"""
+        try:
+            response = self.client.invoke_model_with_response_stream(
+                modelId=self.model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=json.dumps(self.request_body)
+            )
+            self.current_stream = BedrockStreamWrapper(response)
+            self.current_iterator = iter(self.current_stream)
+        except botocore.exceptions.ClientError as e:
+            if 'ExpiredToken' in str(e) or 'expired' in str(e).lower():
+                raise TokenExpiredException("AWS token has expired")
+            raise
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while self.attempt <= self.max_retries:
+            try:
+                if self.current_iterator is None:
+                    self._create_new_stream()
+                
+                return next(self.current_iterator)
+
+            except StopIteration:
+                raise
+
+            except TokenExpiredException:
+                raise  # Let the caller handle token expiration
+
+            except (botocore.exceptions.EventStreamError, Exception) as e:
+                if 'serviceunavailableexception' in str(e).lower():
+                    if self.attempt < self.max_retries:
+                        delay = self._calculate_delay()
+                        console.print(f"[yellow]\nService unavailable. Retrying stream in {delay:.2f} seconds (attempt {self.attempt + 1}/{self.max_retries})...\n[/]")
+                        time.sleep(delay)
+                        self.attempt += 1
+                        self.current_iterator = None  # Force creation of new stream
+                        continue
+                    else:
+                        raise MaxRetriesExceeded(f"Maximum retries ({self.max_retries}) exceeded. Last error: {str(e)}")
+                raise  # Re-raise any other exception
+
+class BedrockClient:
+    """Client for interacting with Amazon Bedrock"""
+    def __init__(self, region_name=None, max_retries=3, base_delay=1.0, max_delay=20.0):
+        try:
+            if not region_name:
+                session = boto3.Session()
+                region_name = session.region_name
+                if not region_name:
+                    raise RuntimeError("No AWS region configured")
+
+            self.client = boto3.client('bedrock-runtime', region_name=region_name)
+            self.region = region_name
+            self.max_retries = max_retries
+            self.base_delay = base_delay
+            self.max_delay = max_delay
+
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == 'AccessDeniedException':
+                raise RuntimeError("Access denied to Bedrock")
+            elif e.response['Error']['Code'] == 'UnrecognizedClientException':
+                raise RuntimeError("Invalid AWS credentials")
+            else:
+                raise RuntimeError(f"Error initializing Bedrock client: {str(e)}")
+        except botocore.exceptions.EndpointConnectionError:
+            raise RuntimeError(f"Could not connect to Bedrock in region {region_name}")
+
+    def create_message(self, model_id: str, messages: list, system: Optional[str] = None,
+                      max_tokens: Optional[int] = None, temperature: Optional[float] = None,
+                      stream: bool = False):
+        """Create a message with retry logic for ServiceUnavailable and ExpiredToken exceptions"""
+        # Format messages for Bedrock
+        formatted_messages = [
+            {
+                "role": msg["role"],
+                "content": [{"type": "text", "text": msg["content"]}]
+            }
+            for msg in messages if msg.get("content")
+        ]
+
+        # Prepare request body
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "messages": formatted_messages,
+            "max_tokens": max_tokens or 4096,
+            "temperature": temperature or 0.7
+        }
+        if system:
+            request_body["system"] = system
+
+        if stream:
+            # Return a RetryingStreamIterator instead of creating the stream directly
+            return RetryingStreamIterator(
+                client=self.client,
+                model_id=model_id,
+                request_body=request_body,
+                max_retries=self.max_retries,
+                base_delay=self.base_delay,
+                max_delay=self.max_delay
+            )
+        else:
+            attempt = 0
+            while attempt <= self.max_retries:
+                try:
+                    response = self.client.invoke_model(
+                        modelId=model_id,
+                        contentType="application/json",
+                        accept="application/json",
+                        body=json.dumps(request_body)
+                    )
+                    response_body = json.loads(response.get('body').read())
+                    return BedrockResponseWrapper(response_body)
+                
+                except botocore.exceptions.ClientError as e:
+                    if 'ExpiredToken' in str(e) or 'expired' in str(e).lower():
+                        raise TokenExpiredException("AWS token has expired")
+                    if 'serviceunavailableexception' in str(e).lower():
+                        if attempt < self.max_retries:
+                            delay = min(self.max_delay, self.base_delay * (2 ** attempt))
+                            jitter = random.uniform(0, 0.1 * delay)
+                            total_delay = delay + jitter
+                            print(f"\nService unavailable. Retrying in {total_delay:.2f} seconds (attempt {attempt + 1}/{self.max_retries})...")
+                            time.sleep(total_delay)
+                            attempt += 1
+                            continue
+                        else:
+                            raise MaxRetriesExceeded(f"Maximum retries ({self.max_retries}) exceeded. Last error: {str(e)}")
+                    raise
+
+            return None  # Should never reach here due to raise statements
 
 def ensure_chat_history_dir():
     """Ensures that the chat history base directory exists."""
@@ -260,7 +357,7 @@ def select_chat_file(chat_history_base_dir):
         print("No previous chats available.")
         return None
 
-    console.print("[bold cyan]\nYour 20 most recent chats with Anthropic models, sorted by most recent first:[/]")
+    console.print("[bold cyan]\nYour 20 most recent chats, sorted by most recent first:[/]")
     for idx, file in enumerate(files):
         display_name = os.path.splitext(os.path.basename(file))[0]
         print(f"{idx + 1}) {display_name}")
@@ -604,16 +701,17 @@ def should_perform_web_search(content, selected_model, model_config, client):
     )
     system_prompt = "Assess if user queries require external web search to enhance responses."
 
-    response = client.messages.create(
-        model=selected_model,
+    response = client.create_message(
+        model_id=selected_model,
         messages=[{"role": "user", "content": decision_prompt}],
         system=system_prompt,
         max_tokens=50,
-        temperature=model_config["temperature"],
+        temperature=model_config["temperature"]
     )
 
-    if response.content[0].text.strip().startswith("YES:"):
-        search_query = response.content[0].text.strip().replace("YES: ", "")
+    response_text = response.content[0].text.strip()
+    if response_text.startswith("YES:"):
+        search_query = response_text.replace("YES: ", "")
         return True, search_query
     else:
         return False, ""
@@ -665,7 +763,12 @@ def main():
     model_config = get_model_config(selected_model)
     friendly_name = model_config["friendly_name"]
     training_cutoff = model_config["training_cutoff"]
-    client = BedrockClient(region_name=region)  # Initialise Bedrock client wrapper with authenticated region
+    client = BedrockClient(
+        region_name=region,
+        max_retries=6,
+        base_delay=1.0,
+        max_delay=20.0
+    )
     web_search_enabled = args.web_search
 
     try:
@@ -718,8 +821,8 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                 if is_directory:
                     markdown_content, token_count = generate_markdown_from_directory(path)
                     if markdown_content == "DIRECTORY TOO BIG.":
-                        print(f"\nThe directory is too large to upload because it is likely larger than 100,000 tokens.\n"
-                              f"Estimated token count for this recursive directory analysis: {token_count}\n")
+                        console.print(f"[yellow]\nThe directory is too large to upload because it is likely larger than 100,000 tokens.\n"
+                              f"Estimated token count for this recursive directory analysis:[/] {token_count}\n")
                     if markdown_content:
                         dir_analysis_request = (f"The following describes a directory structure along with all its contents in "
                                               f"Markdown format. "
@@ -729,25 +832,25 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
                                               f"assurance that you have memorised the contents of the repository and you are ready to "
                                               f"answer the user's questions.\n\n{markdown_content}")
                         append_message(messages, "user", dir_analysis_request)
-                        print(f"\nEstimated token count for this recursive directory analysis: {token_count}\n")
+                        console.print(f"[yellow]\nEstimated token count for this recursive directory analysis:[/] {token_count}\n")
                     else:
                         print_formatted_text(HTML("<ansired>Directory is empty or contains no readable files.</ansired>"))
                         continue
                 else:
                     file_name, file_contents, token_count = read_file_contents(path)
                     if file_contents == "FILE TOO BIG.":
-                        print(f"\nThe file: {file_name} is too large to upload because it is likely larger than 64,000 tokens.\n"
-                              f"Estimated token count for this file: {token_count}\n")
+                        console.print(f"[yellow]\nThe file: {file_name} is too large to upload because it is likely larger than 64,000 tokens.\n"
+                              f"Estimated token count for this file:[/] {token_count}\n")
                     elif file_contents:
                         file_analysis_request = (f"Please analyse the contents of the following file:\n"
                                                f"\n{file_name}\n"
                                                f"\n{file_contents}\n"
                                                f"\nEnd your response by asking the user what questions they have about the file.")
                         append_message(messages, "user", file_analysis_request)
-                        print(f"\nEstimated token count for this file: {token_count}\n")
+                        console.print(f"[yellow]\nEstimated token count for this file:[/] {token_count}\n")
                     else:
                         print_formatted_text(HTML(f"\nThe file: {file_name} is empty.\n"))
-                        print(f"Estimated token count for this file: {token_count}\n")
+                        console.print(f"[yellow]Estimated token count for this file:[/] {token_count}\n")
                         continue
             else:
                 append_message(messages, "user", content)
@@ -757,7 +860,7 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
 
                     response_content = ""
                     if web_search_needed:
-                        print("Web search in progress...\n")
+                        console.print(f"[yellow]Web search in progress...\n[/]")
                         try:
                             web_search_results = perform_web_search(search_query)
                             response_content += f"<web-search-results> {web_search_results} </web-search-results>"
@@ -776,38 +879,86 @@ You can pass entire directories (recursively) by entering "Upload: ~/path/to/dir
 
             supports_streaming = model_config.get("supports_streaming", True)
 
-            if supports_streaming:
-                stream = client.create_message(
-                    model_id=selected_model,
-                    messages=messages,
-                    system=system_prompt,
-                    max_tokens=model_config["max_tokens"],
-                    temperature=model_config["temperature"],
-                    stream=True
-                )
+            while True:  # Main interaction loop
+                try:
+                    # Message creation and streaming logic
+                    if supports_streaming:
+                        stream = client.create_message(
+                            model_id=selected_model,
+                            messages=messages,
+                            system=system_prompt,
+                            max_tokens=model_config["max_tokens"],
+                            temperature=model_config["temperature"],
+                            stream=True
+                        )
 
-                complete_message = ""
-                with Live(Markdown(complete_message),
-                          refresh_per_second=10,
-                          console=console,
-                          transient=False) as live:
-                    for chunk in stream:
-                        if chunk.type == "content_block_delta":
-                            if chunk.delta.text:
-                                complete_message += chunk.delta.text
-                                live.update(Markdown(complete_message))
-                        elif chunk.type == "message_stop":
-                            break
-            else:
-                response = client.create_message(
-                    model_id=selected_model,
-                    messages=messages,
-                    system=system_prompt,
-                    max_tokens=model_config["max_tokens"],
-                    temperature=model_config["temperature"]
-                )
-                complete_message = response.content[0].text
-                console.print(Markdown(complete_message))
+                        complete_message = ""
+                        with Live(Markdown(complete_message),
+                                  refresh_per_second=10,
+                                  console=console,
+                                  transient=False) as live:
+                            for chunk in stream:
+                                if chunk.type == "content_block_delta":
+                                    if chunk.delta.text:
+                                        complete_message += chunk.delta.text
+                                        live.update(Markdown(complete_message))
+                                elif chunk.type == "message_stop":
+                                    break
+                    else:
+                        response = client.create_message(
+                            model_id=selected_model,
+                            messages=messages,
+                            system=system_prompt,
+                            max_tokens=model_config["max_tokens"],
+                            temperature=model_config["temperature"]
+                        )
+                        complete_message = response.content[0].text
+                        console.print(Markdown(complete_message))
+
+                    # If we get here, the message was processed successfully
+                    break
+
+                except TokenExpiredException:
+                    console.print(f"[yellow]\nYour AWS authentication token has expired.[/]")
+                    console.print(f"[yellow]Please reauthenticate using your preferred method (e.g. Leapp or saml2aws)[/]")
+                    
+                    while True:  # Retry loop for token refresh
+                        try:
+                            input("\nPress ENTER to retry after reauthenticating, or CTRL+C to exit...")
+                            
+                            # Force refresh of AWS credentials
+                            success, new_region, error_msg = refresh_aws_session()
+                            if not success:
+                                console.print(f"[yellow]\n{error_msg}\nPlease ensure you have reauthenticated properly.[/]")
+                                continue
+                            
+                            # Create new client with fresh credentials
+                            client = BedrockClient(
+                                region_name=new_region,
+                                max_retries=6,
+                                base_delay=1.0,
+                                max_delay=20.0
+                            )
+                            
+                            # Verify the new client works
+                            is_authenticated, _, auth_error = check_aws_authentication()
+                            if not is_authenticated:
+                                if auth_error:
+                                    console.print(f"[yellow]\n{auth_error}[/]")
+                                console.print("[yellow]\nFailed to establish connection with AWS. Please ensure you have reauthenticated properly.[/]")
+                                continue
+                            
+                            console.print(f"[yellow]\nSuccessfully reconnected to AWS. Retrying your request...\n[/]")
+                            break  # Break out of the token refresh retry loop
+                            
+                        except KeyboardInterrupt:
+                            print("\nExiting...")
+                            sys.exit(0)
+                        except Exception as e:
+                            console.print(f"[yellow]\nError creating Bedrock client: {str(e)}\nPlease ensure you have reauthenticated properly.[/]")
+                            continue
+                    
+                    continue  # Retry the message with new client
 
             append_message(messages, "assistant", complete_message)
 
