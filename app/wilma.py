@@ -647,6 +647,11 @@ def parse_arguments():
         help="Enable web search functionality for answering queries."
     )
     parser.add_argument(
+        "-1", "--new",
+        action='store_true',
+        help="Quick-start a new chat skipping the first menu."
+    )
+    parser.add_argument(
         "--debug",
         action='store_true',
         help="Enable debug output"
@@ -786,16 +791,19 @@ def main():
                         f"responses in Markdown syntax. Use `- ` for any unnumbered bullet point lists, as per "
                         f"standard Markdown syntax.")
 
-        choice = main_menu()
-        if choice == "2":
-            chat_file = select_chat_file(chat_history_base_dir)
-            if chat_file:
-                messages = load_chat(chat_file)
-            else:
-                print("No chat selected or file not found.")
-                return
-        else:
+        if args.new:
             messages = []
+        else:
+            choice = main_menu()
+            if choice == "2":
+                chat_file = select_chat_file(chat_history_base_dir)
+                if chat_file:
+                    messages = load_chat(chat_file)
+                else:
+                    print("No chat selected or file not found.")
+                    return
+            else:
+                messages = []
 
         welcome = f"""
 You're now chatting with {friendly_name} via Amazon Bedrock.
