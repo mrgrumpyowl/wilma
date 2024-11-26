@@ -81,16 +81,19 @@ chmod +x app/wilma.py
 ### Command Line Options
 
 ```bash
-wilma.py [-h] [-m [MODEL]] [-ws] [--debug]
+usage: wilma.py [-h] [-a PROMPT] [-m [MODEL]] [-ws] [-1] [--debug]
 
 options:
   -h, --help            show this help message and exit
+  -a PROMPT, --ask PROMPT
+                        Quick-start a new chat with an initial question/prompt.
   -m [MODEL], --model-select [MODEL]
                         Select the Anthropic (via Amazon Bedrock) model to use. Options:
                           - Specify a model name directly
                           - Use without a value to select from a list of models available in your authenticated AWS region
                           - Omit to use the default model (claude-3-5-sonnet-20241022)
   -ws, --web-search     Enable web search functionality for answering queries.
+  -1, --new             Quick-start a new chat skipping the first menu.
   --debug               Enable debug output
 ```
 

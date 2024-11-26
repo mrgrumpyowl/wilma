@@ -635,7 +635,7 @@ def parse_arguments():
         "-a", "--ask",
         type=str,
         metavar="PROMPT",
-        help="Start a new chat with an initial question/prompt"
+        help="Quick-start a new chat with an initial question/prompt."
     )
     parser.add_argument(
         "-m", "--model-select",
