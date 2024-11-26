@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Dates in this file are in format of YYYY-MM-DD (2019-12-13 means 13th of December 2019).
 
+## [[0.4.0]](https://github.com/mrgrumpyowl/wilma/releases/tag/0.4.0) - 2024-11-26
+
+### Added
+* New functionality: Starting wilma with -a / --ask arg followed by a prompt will skip the menu and immediately garner a response. [@mrgrumpyowl](https://github.com/mrgrumpyowl)
+* New functionality: Starting wilma with -1 / --new arg skips the first menu, pre-selecting the new chat option. [@mrgrumpyowl](https://github.com/mrgrumpyowl)
+
 ## [[0.3.0]](https://github.com/mrgrumpyowl/wilma/releases/tag/0.3.0) - 2024-11-25
 
 ### Changed
