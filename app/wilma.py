@@ -632,6 +632,12 @@ def parse_arguments():
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
+        "-a", "--ask",
+        type=str,
+        metavar="PROMPT",
+        help="Start a new chat with an initial question/prompt"
+    )
+    parser.add_argument(
         "-m", "--model-select",
         nargs='?',
         const='show_menu',
@@ -901,10 +907,15 @@ class ChatSession:
         
         return True  # Continue chat
 
-    def start_interactive_session(self):
+    def process_single_message(self, content):
+        """Process a single message and return, without starting an interactive session"""
+        self.process_message(content)
+        
+    def start_interactive_session(self, skip_welcome=False):
         """Start the interactive chat session loop"""
         try:
-            welcome = f"""
+            if not skip_welcome:
+                welcome = f"""
 You're now chatting with {self.model_config['friendly_name']} via Amazon Bedrock.
 The user prompt handles multiline input, so Enter gives a newline.
 To submit your prompt hit Esc -> Enter.
@@ -913,7 +924,7 @@ To exit gracefully simply submit the word: "exit", or hit Ctrl+C.
 You can pass individual utf-8 encoded files by entering "Upload: ~/path/to/file_name"
 You can pass entire directories (recursively) by entering "Upload: ~/path/to/directory"
 """
-            console.print(f"[bold blue]{welcome}[/]")
+                console.print(f"[bold blue]{welcome}[/]")
 
             while True:
                 content = get_user_input()
@@ -967,8 +978,8 @@ def main():
     )
 
     try:
-        # Initialize chat history
-        if args.new:
+        # Initialize chat history - note we force new chat if --ask is used
+        if args.ask or args.new:
             messages = []
         else:
             choice = main_menu()
@@ -1002,7 +1013,14 @@ def main():
             web_search_enabled=web_search_enabled
         )
         
-        session.start_interactive_session()
+        if args.ask:
+            # Process the ask argument and then start interactive session
+            session.process_single_message(args.ask)
+            # Start interactive session but skip the welcome message
+            session.start_interactive_session(skip_welcome=True)
+        else:
+            # Normal interactive session with welcome message
+            session.start_interactive_session()
 
     except KeyboardInterrupt:
         print("\nInterrupted by user")
