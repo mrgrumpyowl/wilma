@@ -737,6 +737,196 @@ def check_web_search_availability(web_search_requested):
 
     return True
 
+class ChatSession:
+    def __init__(self, client, model_config, messages, system_prompt, web_search_enabled=False):
+        self.client = client
+        self.model_config = model_config
+        self.messages = messages
+        self.system_prompt = system_prompt
+        self.web_search_enabled = web_search_enabled
+        self.selected_model = model_config["model_id"]
+        self.supports_streaming = model_config.get("supports_streaming", True)
+        
+    def process_message(self, content):
+        """Process a single message and get the model's response"""
+        if should_exit(content):
+            return False
+            
+        console.print(f"\n[yellow underline]{self.model_config['friendly_name']}:[/]")
+        
+        is_file_request, path, is_directory = detect_file_analysis_request(content)
+        if is_file_request:
+            if is_directory:
+                markdown_content, token_count = generate_markdown_from_directory(path)
+                if markdown_content == "DIRECTORY TOO BIG.":
+                    console.print(f"[yellow]\nThe directory is too large to upload because it is likely larger than 100,000 tokens.\n"
+                          f"Estimated token count for this recursive directory analysis:[/] {token_count}\n")
+                if markdown_content:
+                    dir_analysis_request = (f"The following describes a directory structure along with all its contents in "
+                                          f"Markdown format. "
+                                          f"Please carefully analyse the directory structure and the files contained within. Pay "
+                                          f"attention to whether the directory structure looks like a code repository. Then take a "
+                                          f"deep breath and provide a brief summary of your analysis. End your response with an "
+                                          f"assurance that you have memorised the contents of the repository and you are ready to "
+                                          f"answer the user's questions.\n\n{markdown_content}")
+                    append_message(self.messages, "user", dir_analysis_request)
+                    console.print(f"[yellow]\nEstimated token count for this recursive directory analysis:[/] {token_count}\n")
+                else:
+                    print_formatted_text(HTML("<ansired>Directory is empty or contains no readable files.</ansired>"))
+                    return True
+            else:
+                file_name, file_contents, token_count = read_file_contents(path)
+                if file_contents == "FILE TOO BIG.":
+                    console.print(f"[yellow]\nThe file: {file_name} is too large to upload because it is likely larger than 64,000 tokens.\n"
+                          f"Estimated token count for this file:[/] {token_count}\n")
+                elif file_contents:
+                    file_analysis_request = (f"Please analyse the contents of the following file:\n"
+                                           f"\n{file_name}\n"
+                                           f"\n{file_contents}\n"
+                                           f"\nEnd your response by asking the user what questions they have about the file.")
+                    append_message(self.messages, "user", file_analysis_request)
+                    console.print(f"[yellow]\nEstimated token count for this file:[/] {token_count}\n")
+                else:
+                    print_formatted_text(HTML(f"\nThe file: {file_name} is empty.\n"))
+                    console.print(f"[yellow]Estimated token count for this file:[/] {token_count}\n")
+                    return True
+        else:
+            append_message(self.messages, "user", content)
+
+            if self.web_search_enabled:
+                web_search_needed, search_query = should_perform_web_search(content, self.selected_model, self.model_config, self.client)
+
+                response_content = ""
+                if web_search_needed:
+                    console.print(f"[yellow]Web search in progress...\n[/]")
+                    try:
+                        web_search_results = perform_web_search(search_query)
+                        response_content += f"<web-search-results> {web_search_results} </web-search-results>"
+                    except Exception as e:
+                        print(f"Error during web search: {e}")
+
+                if response_content:
+                    append_message(self.messages, "assistant", response_content)
+                    websearch_analysis_request = ("Thank you for carrying out a web search on my behalf with Perplexity. "
+                        "The results of the Perplexity web search are contained in the <web-search-results> XML tag in your previous assistant content. "
+                        "You will now take ownership of those <web-search-results> and present them to me, the user, as your own 'research'. "
+                        "Now reflect on those <web-search-results> to augment and inform your own training data as you carefully provide an "
+                        "excellent answer to my original query. Keep these <web-search-results> in mind as we continue our conversation.")
+
+                    append_message(self.messages, "user", websearch_analysis_request)
+
+        while True:  # Token refresh retry loop
+            try:
+                # Message creation and streaming logic
+                if self.supports_streaming:
+                    stream = self.client.create_message(
+                        model_id=self.selected_model,
+                        messages=self.messages,
+                        system=self.system_prompt,
+                        max_tokens=self.model_config["max_tokens"],
+                        temperature=self.model_config["temperature"],
+                        stream=True
+                    )
+
+                    complete_message = ""
+                    with Live(Markdown(complete_message),
+                              refresh_per_second=10,
+                              console=console,
+                              transient=False) as live:
+                        for chunk in stream:
+                            if chunk.type == "content_block_delta":
+                                if chunk.delta.text:
+                                    complete_message += chunk.delta.text
+                                    live.update(Markdown(complete_message))
+                            elif chunk.type == "message_stop":
+                                break
+                else:
+                    response = self.client.create_message(
+                        model_id=self.selected_model,
+                        messages=self.messages,
+                        system=self.system_prompt,
+                        max_tokens=self.model_config["max_tokens"],
+                        temperature=self.model_config["temperature"]
+                    )
+                    complete_message = response.content[0].text
+                    console.print(Markdown(complete_message))
+
+                append_message(self.messages, "assistant", complete_message)
+                print("\n")
+                print(Rule(), "")
+                
+                # Save chat after successful response
+                chat_history_base_dir = ensure_chat_history_dir()
+                todays_chat_dir = get_todays_chat_dir(chat_history_base_dir)
+                save_chat(self.messages, todays_chat_dir)
+                
+                break  # Break out of token refresh retry loop on success
+                
+            except TokenExpiredException:
+                console.print(f"[yellow]\nYour AWS authentication token has expired.[/]")
+                console.print(f"[yellow]Please reauthenticate using your preferred method (e.g. Leapp or saml2aws)[/]")
+                
+                while True:  # Token refresh prompt loop
+                    try:
+                        input("\nPress ENTER to retry after reauthenticating, or CTRL+C to exit...")
+                        
+                        # Force refresh of AWS credentials
+                        success, new_region, error_msg = refresh_aws_session()
+                        if not success:
+                            console.print(f"[yellow]\n{error_msg}\nPlease ensure you have reauthenticated properly.[/]")
+                            continue
+                        
+                        # Create new client with fresh credentials
+                        self.client = BedrockClient(
+                            region_name=new_region,
+                            max_retries=6,
+                            base_delay=1.0,
+                            max_delay=20.0
+                        )
+                        
+                        # Verify the new client works
+                        is_authenticated, _, auth_error = check_aws_authentication()
+                        if not is_authenticated:
+                            if auth_error:
+                                console.print(f"[yellow]\n{auth_error}[/]")
+                            console.print("[yellow]\nFailed to establish connection with AWS. Please ensure you have reauthenticated properly.[/]")
+                            continue
+                        
+                        console.print(f"[yellow]\nSuccessfully reconnected to AWS. Retrying your request...\n[/]")
+                        break  # Break out of token refresh prompt loop
+                        
+                    except KeyboardInterrupt:
+                        print("\nExiting...")
+                        sys.exit(0)
+        
+        return True  # Continue chat
+
+    def start_interactive_session(self):
+        """Start the interactive chat session loop"""
+        try:
+            welcome = f"""
+You're now chatting with {self.model_config['friendly_name']} via Amazon Bedrock.
+The user prompt handles multiline input, so Enter gives a newline.
+To submit your prompt hit Esc -> Enter.
+To exit gracefully simply submit the word: "exit", or hit Ctrl+C.
+
+You can pass individual utf-8 encoded files by entering "Upload: ~/path/to/file_name"
+You can pass entire directories (recursively) by entering "Upload: ~/path/to/directory"
+"""
+            console.print(f"[bold blue]{welcome}[/]")
+
+            while True:
+                content = get_user_input()
+                if not self.process_message(content):
+                    break
+
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+            try:
+                sys.exit(0)
+            except SystemExit:
+                os._exit(0)
+
 def main():
     is_authenticated, region, error_message = check_aws_authentication()
 
@@ -766,6 +956,7 @@ def main():
         selected_model = check_default_model(default_model, region, debug=args.debug)
 
     model_config = get_model_config(selected_model)
+    model_config["model_id"] = selected_model  # Add model_id to config
     friendly_name = model_config["friendly_name"]
     training_cutoff = model_config["training_cutoff"]
     client = BedrockClient(
@@ -774,23 +965,9 @@ def main():
         base_delay=1.0,
         max_delay=20.0
     )
-    web_search_enabled = args.web_search
 
     try:
-        # Initialise and ensure chat history directories
-        chat_history_base_dir = ensure_chat_history_dir()
-        todays_chat_dir = get_todays_chat_dir(chat_history_base_dir)
-
-        now = datetime.now()
-        local_date = now.strftime("%a %d %b %Y")
-        local_time = now.strftime("%H:%M:%S %Z")
-
-        system_prompt = (f"Specifically, your model is \"{friendly_name}\". Your knowledge base was last updated "
-                        f"in {training_cutoff}. Today is {local_date}. Local time is {local_time}. You write in British "
-                        f"English and you are not too quick to apologise or thank the user. You MUST format your "
-                        f"responses in Markdown syntax. Use `- ` for any unnumbered bullet point lists, as per "
-                        f"standard Markdown syntax.")
-
+        # Initialize chat history
         if args.new:
             messages = []
         else:
@@ -805,175 +982,27 @@ def main():
             else:
                 messages = []
 
-        welcome = f"""
-You're now chatting with {friendly_name} via Amazon Bedrock.
-The user prompt handles multiline input, so Enter gives a newline.
-To submit your prompt hit Esc -> Enter.
-To exit gracefully simply submit the word: "exit", or hit Ctrl+C.
+        # Set up system prompt
+        now = datetime.now()
+        local_date = now.strftime("%a %d %b %Y")
+        local_time = now.strftime("%H:%M:%S %Z")
 
-You can pass individual utf-8 encoded files by entering "Upload: ~/path/to/file_name"
-You can pass entire directories (recursively) by entering "Upload: ~/path/to/directory"
-"""
+        system_prompt = (f"Specifically, your model is \"{friendly_name}\". Your knowledge base was last updated "
+                        f"in {training_cutoff}. Today is {local_date}. Local time is {local_time}. You write in British "
+                        f"English and you are not too quick to apologise or thank the user. You MUST format your "
+                        f"responses in Markdown syntax. Use `- ` for any unnumbered bullet point lists, as per "
+                        f"standard Markdown syntax.")
 
-        console.print(f"[bold blue]{welcome}[/]")
-
-        while True:
-            content = get_user_input()
-
-            if should_exit(content):
-                break
-
-            console.print(f"\n[yellow underline]{friendly_name}:[/]")
-            is_file_request, path, is_directory = detect_file_analysis_request(content)
-            if is_file_request:
-                if is_directory:
-                    markdown_content, token_count = generate_markdown_from_directory(path)
-                    if markdown_content == "DIRECTORY TOO BIG.":
-                        console.print(f"[yellow]\nThe directory is too large to upload because it is likely larger than 100,000 tokens.\n"
-                              f"Estimated token count for this recursive directory analysis:[/] {token_count}\n")
-                    if markdown_content:
-                        dir_analysis_request = (f"The following describes a directory structure along with all its contents in "
-                                              f"Markdown format. "
-                                              f"Please carefully analyse the directory structure and the files contained within. Pay "
-                                              f"attention to whether the directory structure looks like a code repository. Then take a "
-                                              f"deep breath and provide a brief summary of your analysis. End your response with an "
-                                              f"assurance that you have memorised the contents of the repository and you are ready to "
-                                              f"answer the user's questions.\n\n{markdown_content}")
-                        append_message(messages, "user", dir_analysis_request)
-                        console.print(f"[yellow]\nEstimated token count for this recursive directory analysis:[/] {token_count}\n")
-                    else:
-                        print_formatted_text(HTML("<ansired>Directory is empty or contains no readable files.</ansired>"))
-                        continue
-                else:
-                    file_name, file_contents, token_count = read_file_contents(path)
-                    if file_contents == "FILE TOO BIG.":
-                        console.print(f"[yellow]\nThe file: {file_name} is too large to upload because it is likely larger than 64,000 tokens.\n"
-                              f"Estimated token count for this file:[/] {token_count}\n")
-                    elif file_contents:
-                        file_analysis_request = (f"Please analyse the contents of the following file:\n"
-                                               f"\n{file_name}\n"
-                                               f"\n{file_contents}\n"
-                                               f"\nEnd your response by asking the user what questions they have about the file.")
-                        append_message(messages, "user", file_analysis_request)
-                        console.print(f"[yellow]\nEstimated token count for this file:[/] {token_count}\n")
-                    else:
-                        print_formatted_text(HTML(f"\nThe file: {file_name} is empty.\n"))
-                        console.print(f"[yellow]Estimated token count for this file:[/] {token_count}\n")
-                        continue
-            else:
-                append_message(messages, "user", content)
-
-                if web_search_enabled:
-                    web_search_needed, search_query = should_perform_web_search(content, selected_model, model_config, client)
-
-                    response_content = ""
-                    if web_search_needed:
-                        console.print(f"[yellow]Web search in progress...\n[/]")
-                        try:
-                            web_search_results = perform_web_search(search_query)
-                            response_content += f"<web-search-results> {web_search_results} </web-search-results>"
-                        except Exception as e:
-                            print(f"Error during web search: {e}")
-
-                    if response_content:
-                        append_message(messages, "assistant", response_content)
-                        websearch_analysis_request = ("Thank you for carrying out a web search on my behalf with Perplexity. "
-                            "The results of the Perplexity web search are contained in the <web-search-results> XML tag in your previous assistant content. "
-                            "You will now take ownership of those <web-search-results> and present them to me, the user, as your own 'research'. "
-                            "Now reflect on those <web-search-results> to augment and inform your own training data as you carefully provide an "
-                            "excellent answer to my original query. Keep these <web-search-results> in mind as we continue our conversation.")
-
-                        append_message(messages, "user", websearch_analysis_request)
-
-            supports_streaming = model_config.get("supports_streaming", True)
-
-            while True:  # Main interaction loop
-                try:
-                    # Message creation and streaming logic
-                    if supports_streaming:
-                        stream = client.create_message(
-                            model_id=selected_model,
-                            messages=messages,
-                            system=system_prompt,
-                            max_tokens=model_config["max_tokens"],
-                            temperature=model_config["temperature"],
-                            stream=True
-                        )
-
-                        complete_message = ""
-                        with Live(Markdown(complete_message),
-                                  refresh_per_second=10,
-                                  console=console,
-                                  transient=False) as live:
-                            for chunk in stream:
-                                if chunk.type == "content_block_delta":
-                                    if chunk.delta.text:
-                                        complete_message += chunk.delta.text
-                                        live.update(Markdown(complete_message))
-                                elif chunk.type == "message_stop":
-                                    break
-                    else:
-                        response = client.create_message(
-                            model_id=selected_model,
-                            messages=messages,
-                            system=system_prompt,
-                            max_tokens=model_config["max_tokens"],
-                            temperature=model_config["temperature"]
-                        )
-                        complete_message = response.content[0].text
-                        console.print(Markdown(complete_message))
-
-                    # If we get here, the message was processed successfully
-                    break
-
-                except TokenExpiredException:
-                    console.print(f"[yellow]\nYour AWS authentication token has expired.[/]")
-                    console.print(f"[yellow]Please reauthenticate using your preferred method (e.g. Leapp or saml2aws)[/]")
-                    
-                    while True:  # Retry loop for token refresh
-                        try:
-                            input("\nPress ENTER to retry after reauthenticating, or CTRL+C to exit...")
-                            
-                            # Force refresh of AWS credentials
-                            success, new_region, error_msg = refresh_aws_session()
-                            if not success:
-                                console.print(f"[yellow]\n{error_msg}\nPlease ensure you have reauthenticated properly.[/]")
-                                continue
-                            
-                            # Create new client with fresh credentials
-                            client = BedrockClient(
-                                region_name=new_region,
-                                max_retries=6,
-                                base_delay=1.0,
-                                max_delay=20.0
-                            )
-                            
-                            # Verify the new client works
-                            is_authenticated, _, auth_error = check_aws_authentication()
-                            if not is_authenticated:
-                                if auth_error:
-                                    console.print(f"[yellow]\n{auth_error}[/]")
-                                console.print("[yellow]\nFailed to establish connection with AWS. Please ensure you have reauthenticated properly.[/]")
-                                continue
-                            
-                            console.print(f"[yellow]\nSuccessfully reconnected to AWS. Retrying your request...\n[/]")
-                            break  # Break out of the token refresh retry loop
-                            
-                        except KeyboardInterrupt:
-                            print("\nExiting...")
-                            sys.exit(0)
-                        except Exception as e:
-                            console.print(f"[yellow]\nError creating Bedrock client: {str(e)}\nPlease ensure you have reauthenticated properly.[/]")
-                            continue
-                    
-                    continue  # Retry the message with new client
-
-            append_message(messages, "assistant", complete_message)
-
-            print("\n")
-            print(Rule(), "")
-
-            save_chat(messages, todays_chat_dir)
+        # Create and start chat session
+        session = ChatSession(
+            client=client,
+            model_config=model_config,
+            messages=messages,
+            system_prompt=system_prompt,
+            web_search_enabled=web_search_enabled
+        )
+        
+        session.start_interactive_session()
 
     except KeyboardInterrupt:
         print("\nInterrupted by user")
