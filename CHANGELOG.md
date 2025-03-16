@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Dates in this file are in format of YYYY-MM-DD (2019-12-13 means 13th of December 2019).
 
+## [[unreleased]]()
+
+### Added
+* added new sonnet 3.7 access. [@ev1lbunny](https://github.com/ev1lbunny)
+* added new capability to manage inference profiles (needed for sonnet 3.7 and other models). [@ev1lbunny](https://github.com/ev1lbunny)
+
+### Changed
+* model filter function to now allow it to list items that require an inference profile. [@ev1lbunny](https://github.com/ev1lbunny)
+
 ## [[0.4.0]](https://github.com/mrgrumpyowl/wilma/releases/tag/0.4.0) - 2024-11-26
 
 ### Added
