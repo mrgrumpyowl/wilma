@@ -1,43 +1,34 @@
-"""
-Setup.
-
-Package Setup.
-"""
-
-from setuptools import find_packages
-from setuptools import setup
-
-print("Detected Packages:", find_packages())
+from setuptools import setup, find_packages
 
 setup(
     name="wilma",
-    version="0.3.0",
-    description="An Anthropic Claude chatbot that uses Amazon Bedrock",
+    version="1.1.0",
+    description="Simplified CLI Chat Interface for Claude via Amazon Bedrock",
     author="Contributors",
-    url=("https://github.com/mrgrumpyowl/wilma.git"),
-    py_modules=["wilma", "model_config"],
+    url="https://github.com/mrgrumpyowl/wilma",
+    packages=find_packages(),
     classifiers=[
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
-        "Programming Language :: Python :: Implementation :: CPython",
-        "Programming Language :: Python :: Implementation :: PyPy",
     ],
     install_requires=[
-        "anthropic",
-        "boto3",
-        "botocore",
-        "halo",
-        "prompt_toolkit",
-        "rich",
-        "requests",
-        "tiktoken",
+        "boto3>=1.28.0",
+        "botocore>=1.31.0",
+        "prompt_toolkit>=3.0.0",
+        "rich>=13.0.0",
+        "pathlib>=1.0.0",
+        "tiktoken>=0.3.0",
+        "halo>=0.0.31",
+        "requests>=2.28.0",
     ],
     entry_points={
         "console_scripts": [
-            "wilma = wilma:main",
+            "wilma = wilma.main:main",
         ],
     },
+    python_requires=">=3.10",
+    include_package_data=True,
 )
